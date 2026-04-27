@@ -90,7 +90,7 @@
    - SSH 连通性检测、远程命令执行、错误码处理。
 4. ros_adapter.py
    - 统一订阅状态、发布控制。
-5. rviz_manager.py
+5. rviz_manager.py 
    - RViz 进程启动、关闭、重复拉起保护、异常退出检测。
 6. settings.yaml
    - 双机连接参数、流程超时与重试策略、RViz 配置路径。
