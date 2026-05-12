@@ -1,0 +1,8 @@
+[2026-05-12 17:47:56] [TASK] started: start_basic_chain
+[2026-05-12 17:47:56] [TASK] start_basic_chain 开始
+[2026-05-12 17:47:56] [TASK] 1号机 start_basic_chain 开始
+[2026-05-12 17:48:22] [TASK] 1号机 start_basic_chain 结束 success=False window=7_bridge
+[2026-05-12 17:48:22] [TASK] 2号机 start_basic_chain 开始
+[2026-05-12 17:48:47] [TASK] 2号机 start_basic_chain 结束 success=False window=7_bridge
+[2026-05-12 17:48:47] [TASK] start_basic_chain 结束 success=False
+[2026-05-12 17:48:47] [TASK] finished: start_basic_chain, success=False

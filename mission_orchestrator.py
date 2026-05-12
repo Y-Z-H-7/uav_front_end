@@ -47,6 +47,8 @@ class MissionOrchestrator:
 
     SSH_CONNECT_TIMEOUT_SEC = 8
     COMMAND_TIMEOUT_SEC = 45
+    FIRST_WINDOW_DELAY_SEC = 7
+    FOLLOWING_WINDOW_DELAY_SEC = 3
 
     def _format_exception(self, exc: Exception) -> str:
         return f"{type(exc).__name__}: {exc}"
@@ -195,18 +197,50 @@ class MissionOrchestrator:
 
         return all_ok
     def start_basic_chain(self, log: LogFn) -> bool:
-        """Create tmux sessions on each drone and start windows 1-7 automatically.
+        """Create tmux sessions on each drone and start windows 1-7 sequentially.
 
-        For windows 8 and 9 we create the windows and populate the command but do not execute it;
-        those are triggered by the "启动程控" and "启动探索" buttons which will send Enter.
+        Window 1 waits 7 seconds before window 2; all later windows wait 3 seconds.
+        Windows 8 and 9 are prepared but not executed here.
         """
-        all_ok = True
-        log("[START] 基础链路启动开始 (在远端创建 tmux session 并按 1-7 启动)")
 
-        # per-drone terminal definitions (window name and components)
+        def px4_cmd() -> str:
+            return (
+                "echo 8888 | sudo -S bash -c "
+                "'source /opt/ros/noetic/setup.bash && "
+                "if [ -e /dev/ttyACM0 ]; then chmod 777 /dev/ttyACM0; fi && "
+                "roslaunch mavros px4.launch'"
+            )
+
+        def build_full_command(setups, cd_cmd, main_cmd):
+            parts = [*setups]
+            if cd_cmd:
+                parts.append(f"cd {cd_cmd}")
+            parts.append(main_cmd)
+            return " && ".join(parts)
+
+        def create_session_command(session_name: str, term_name: str) -> str:
+            return (
+                f"if tmux has-session -t {shlex.quote(session_name)} >/dev/null 2>&1; then "
+                f"tmux kill-session -t {shlex.quote(session_name)}; fi; "
+                f"tmux new-session -d -s {shlex.quote(session_name)} -n {shlex.quote(term_name)}"
+            )
+
+        def create_window_command(session_name: str, window_name: str, command: str, execute: bool) -> str:
+            target = f"{session_name}:{window_name}"
+            quoted_target = shlex.quote(target)
+            if execute:
+                return (
+                    f"tmux new-window -d -t {shlex.quote(session_name)} -n {shlex.quote(window_name)}; "
+                    f"tmux send-keys -t {quoted_target} {shlex.quote(command)} Enter"
+                )
+            return (
+                f"tmux new-window -d -t {shlex.quote(session_name)} -n {shlex.quote(window_name)}; "
+                f"tmux send-keys -t {quoted_target} {shlex.quote(command)}"
+            )
+
         per_drone_terms = {
-            'nuc_drone': [
-                ("1_px4", [], "", "echo 8888 | sudo -S bash -c 'source /opt/ros/noetic/setup.bash && chmod 777 /dev/ttyACM0 && roslaunch mavros px4.launch'", True),
+            "nuc_drone": [
+                ("1_px4", [], "", px4_cmd(), True),
                 ("2_livox", [], "", "roslaunch livox_ros_driver2 msg_MID360.launch", True),
                 ("3_fastlio", [], "", "roslaunch fast_lio mapping_mid360.launch", True),
                 ("4_offb_node", ["source ~/racer/devel/setup.bash"], "", "rosrun cxr_egoctrl_v1 offb_node", True),
@@ -216,8 +250,8 @@ class MissionOrchestrator:
                 ("8_cxr_egoctrl", ["source ~/racer/devel/setup.bash"], "", "rosrun cxr_egoctrl_v1 cxr_egoctrl_v2", False),
                 ("9_exploration", ["source ~/racer/devel/setup.bash"], "", "roslaunch exploration_manager swarm_exploration_realworld.launch 2>&1 | tee '/home/nuc/文档/swarm$(date +%Y%m%d%H%M%S).log'", False),
             ],
-            'fly_drone': [
-                ("1_px4", [], "", "echo 8888 | sudo -S bash -c 'source /opt/ros/noetic/setup.bash && chmod 777 /dev/ttyACM0 && roslaunch mavros px4.launch'", True),
+            "fly_drone": [
+                ("1_px4", [], "", px4_cmd(), True),
                 ("2_livox", [], "", "roslaunch livox_ros_driver2 msg_MID360.launch", True),
                 ("3_fastlio", [], "", "roslaunch fast_lio mapping_mid360.launch", True),
                 ("4_offb_node", ["source ~/racer/devel/setup.bash"], "", "rosrun cxr_egoctrl_v1 offb_node", True),
@@ -229,117 +263,105 @@ class MissionOrchestrator:
             ],
         }
 
+        all_ok = True
+        log("[TASK] start_basic_chain 开始")
+
         for drone in self.DRONES.values():
             terms = per_drone_terms.get(drone.session_name)
             if not terms:
-                log(f"[START] 未知 session 配置: {drone.session_name}")
                 all_ok = False
                 continue
 
-            # Build a remote shell script that kills old session and recreates windows
-            parts = []
-            parts.append(f"if tmux has-session -t {shlex.quote(drone.session_name)} >/dev/null 2>&1; then tmux kill-session -t {shlex.quote(drone.session_name)}; fi")
-            # create first window (new-session)
-            name0, setups0, cd0, cmd0, auto0 = terms[0]
-            cmd_chain0 = ' && '.join([f"{s}" for s in setups0] + ([f"cd {cd0}"] if cd0 else []) + [cmd0]) if (setups0 or cd0) else cmd0
-            parts.append(f"tmux new-session -d -s {shlex.quote(drone.session_name)} -n {shlex.quote(name0)} '{cmd_chain0}'")
-            # remaining windows
-            for idx, (wname, setups, cd, main_cmd, auto_exec) in enumerate(terms[1:], start=1):
-                # create window
-                parts.append(f"tmux new-window -t {shlex.quote(drone.session_name)} -n {shlex.quote(wname)}")
-                # prepare full command string with setups and cd
-                full_cmd = ' && '.join([f"{s}" for s in setups] + ([f"cd {cd}"] if cd else []) + [main_cmd]) if (setups or cd) else main_cmd
-                if auto_exec:
-                    # send keys and press Enter to execute
-                    parts.append(f"tmux send-keys -t {shlex.quote(drone.session_name)}:{idx} {shlex.quote(full_cmd)} Enter")
-                else:
-                    # populate the command but do not execute (no Enter)
-                    parts.append(f"tmux send-keys -t {shlex.quote(drone.session_name)}:{idx} {shlex.quote(full_cmd)}")
+            last_started_window = terms[0][0]
+            log(f"[TASK] {drone.display_name} start_basic_chain 开始")
 
-            remote_script = '; '.join(parts)
-            code, out, err = self._run_remote_command(drone, remote_script, log=log, context=f"START {drone.display_name}")
-            if out:
-                log(f"[START] {drone.display_name} stdout: {out[:400]}")
-            if err:
-                log(f"[START] {drone.display_name} stderr: {err[:400]}")
-
-            session_ok, detail = self._check_session(drone, log=log)
-            log(f"[STATUS] {drone.display_name} {detail}")
-            if code != 0 or not session_ok:
+            first_name, first_setups, first_cd, first_cmd, first_exec = terms[0]
+            first_full = build_full_command(first_setups, first_cd, first_cmd)
+            first_remote = create_session_command(drone.session_name, first_name)
+            code, _, _ = self._run_remote_command(drone, first_remote, log=None, context=f"START {drone.display_name}")
+            if code != 0:
                 all_ok = False
-                log(f"[START] {drone.display_name} 启动未完全确认，请检查远端 tmux 会话")
+            else:
+                start_cmd = f"tmux send-keys -t {shlex.quote(f'{drone.session_name}:0')} {shlex.quote(first_full)} Enter"
+                code, _, _ = self._run_remote_command(drone, start_cmd, log=None, context=f"START {drone.display_name}")
+                if code != 0:
+                    all_ok = False
 
-        if all_ok:
-            log("[START] 基础链路已完成，tmux session 已重建并配置窗口 1-9（8/9 为未执行命令）")
+            time.sleep(self.FIRST_WINDOW_DELAY_SEC)
 
+            for idx, (window_name, setups, cd_cmd, main_cmd, execute) in enumerate(terms[1:7], start=1):
+                last_started_window = window_name
+                full_cmd = build_full_command(setups, cd_cmd, main_cmd)
+                remote_cmd = create_window_command(drone.session_name, window_name, full_cmd, execute)
+                code, _, _ = self._run_remote_command(drone, remote_cmd, log=None, context=f"START {drone.display_name}")
+                if code != 0:
+                    all_ok = False
+                if idx < 6:
+                    time.sleep(self.FOLLOWING_WINDOW_DELAY_SEC)
+
+            for window_name, setups, cd_cmd, main_cmd, execute in terms[7:9]:
+                full_cmd = build_full_command(setups, cd_cmd, main_cmd)
+                remote_cmd = create_window_command(drone.session_name, window_name, full_cmd, execute)
+                code, _, _ = self._run_remote_command(drone, remote_cmd, log=None, context=f"START {drone.display_name}")
+                if code != 0:
+                    all_ok = False
+
+            session_ok, _ = self._check_session(drone, log=None)
+            all_ok = all_ok and session_ok
+            log(f"[TASK] {drone.display_name} start_basic_chain 结束 success={session_ok} window={last_started_window}")
+
+        log(f"[TASK] start_basic_chain 结束 success={all_ok}")
         return all_ok
 
     def open_base_chain_terminals(self, log: LogFn) -> bool:
         """Open local attached terminals for both drone tmux sessions."""
         all_ok = True
-        log("[ATTACH] 开始打开两台无人机的 tmux 附着窗口")
+        log("[TASK] open_base_chain_terminals 开始")
         for drone in self.DRONES.values():
-            session_ok, detail = self._check_session(drone, log=log)
-            log(f"[ATTACH] {drone.display_name} {detail}")
+            session_ok, _ = self._check_session(drone, log=None)
             if not session_ok:
                 all_ok = False
-                log(f"[ATTACH] {drone.display_name} session 不存在，请先启动基础链路")
                 continue
 
             remote_command = f"ssh -tt {shlex.quote(drone.ssh_target)} {shlex.quote(f'tmux attach-session -t {drone.session_name}')}"
-            code, _, err = self._launch_local_terminal(remote_command, log=log)
+            code, _, _ = self._launch_local_terminal(remote_command, log=None)
             if code != 0:
                 all_ok = False
-                log(f"[ATTACH] {drone.display_name} 打开失败：{err[:200]}")
-            else:
-                log(f"[ATTACH] {drone.display_name} 已打开附着窗口")
 
+        log(f"[TASK] open_base_chain_terminals 结束 success={all_ok}")
         return all_ok
 
     def trigger_manual_stage(self, stage: str, log: LogFn) -> bool:
         """Trigger manual tmux windows by sending Enter.
 
         stage:
-          - control: window 8 (cxr_egoctrl)
-          - exploration: window 9 (swarm exploration)
+          - control: window 8_cxr_egoctrl
+          - exploration: window 9_exploration
         """
         stage_map = {
-            "control": 8,
-            "exploration": 9,
+            "control": "8_cxr_egoctrl",
+            "exploration": "9_exploration",
         }
-        window_idx = stage_map.get(stage)
-        if window_idx is None:
+        window_name = stage_map.get(stage)
+        if window_name is None:
             log(f"[TASK] unknown stage: {stage}")
             return False
 
         all_ok = True
+        log(f"[TASK] trigger_manual_stage({stage}) 开始")
         for drone in self.DRONES.values():
-            session_ok, detail = self._check_session(drone, log=log)
-            log(f"[TASK] {drone.display_name} {detail}")
+            session_ok, _ = self._check_session(drone, log=None)
             if not session_ok:
                 all_ok = False
-                log(f"[TASK] {drone.display_name} stage={stage} 失败：tmux session 不存在")
                 continue
 
-            cmd = f"tmux send-keys -t {shlex.quote(drone.session_name)}:{window_idx} Enter"
-            code, out, err = self._run_remote_command(
-                drone,
-                cmd,
-                log=log,
-                context=f"TASK {drone.display_name}",
-            )
-            log(
-                f"[TASK] {drone.display_name} stage={stage} window={window_idx} exit_code={code}"
-            )
-            if out:
-                log(f"[TASK] {drone.display_name} stdout: {out[:200]}")
-            if err:
-                log(f"[TASK] {drone.display_name} stderr: {err[:200]}")
-
+            target = f"{drone.session_name}:{window_name}"
+            cmd = f"tmux send-keys -t {shlex.quote(target)} Enter"
+            code, _, _ = self._run_remote_command(drone, cmd, log=None, context=f"TASK {drone.display_name}")
             if code != 0:
                 all_ok = False
-                log(f"[TASK] {drone.display_name} stage={stage} 执行失败")
 
+        log(f"[TASK] trigger_manual_stage({stage}) 结束 success={all_ok}")
         return all_ok
 
     def run_takeoff_sequence_placeholder(self, log: LogFn) -> bool:
