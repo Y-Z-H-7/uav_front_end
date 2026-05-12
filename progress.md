@@ -66,3 +66,43 @@
 1. run_ui.sh 可自动拉起 roscore 并启动 UI。
 2. UI 可触发降落请求发布（地面站侧）。
 3. Python 文件语法检查通过（ui_app.py、ros_adapter.py）。
+
+---
+
+## 会话增量进展（2026-05-12，手动 SSH 模式联调）
+
+### 本次目标
+1. 将前端从“内置自动 SSH 登录”切换为“手动 SSH 前置 + 前端触发命令”。
+2. 在不改变主要按钮流程的前提下，完成 SSH 检测链路可用性验证。
+3. 定位并解决“检查SSH显示基础状态异常”的根因。
+
+### 已实现功能
+1. mission_orchestrator.py 已改为 OpenSSH 命令驱动
+ - 移除 paramiko 直连逻辑。
+ - 统一通过本机 ssh 子进程执行远端命令。
+ - 检测与执行参数：BatchMode=yes、ConnectTimeout=8。
+
+2. UI/任务流程保持一致
+ - 保留检查SSH、启动基础链路、启动程控(7)、启动探索(9)与降落按钮。
+ - 检查SSH时新增基础探针输出（whoami/hostname/pwd/tmux）。
+
+3. 联调目标已收敛为显式地址
+ - 当前 DRONES 中两条 ssh_target 为 nvidia@192.168.18.100（同机占位验证）。
+ - 便于在未完善 Host 别名前快速排查链路。
+
+### 关键排障记录
+1. 发现基础状态异常的直接原因不是网络不可达，而是非交互模式下认证失败。
+2. 交互可登录 != BatchMode 可登录：
+ - 前端后台执行无法输入密码，必须使用公钥免密。
+3. 关键验证命令：
+ - ssh -o BatchMode=yes -o ConnectTimeout=8 nvidia@192.168.18.100 "echo CONNECT_OK && whoami && hostname"
+
+### 当前待完成事项
+1. 远端完成/确认公钥免密配置（authorized_keys 与权限）。
+2. 将双机占位目标替换为真实 1/2 号机（或 uav1/uav2 别名）。
+3. 机载端按原计划继续完成降落状态回读、rosbridge 话题配置与联调。
+
+### 当前可验证项
+1. .venv/bin/python -m py_compile mission_orchestrator.py ui_app.py ros_adapter.py 通过。
+2. 手动运行 check_ssh_connectivity() 可输出分步骤日志并定位认证问题。
+3. 在免密条件满足时，BatchMode SSH 检测链路可通过。

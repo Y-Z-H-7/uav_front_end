@@ -54,18 +54,18 @@ TERMINALS = [
         "note": "偏置转换"
     },
     {
-        "name": "7_cxr_egoctrl",
-        "setup_cmds": ["source ~/racer/devel/setup.bash"],
-        "cd": "",
-        "main_cmd": "rosrun cxr_egoctrl_v1 cxr_egoctrl_v2",
-        "note": "【程控】最后开！！"
-    },
-    {
-        "name": "8_bridge",
+        "name": "7_bridge",
         "setup_cmds": ["source ~/swarm_ros_bridge_ws/devel/setup.bash"],
         "cd": "",
         "main_cmd": "roslaunch swarm_ros_bridge bridge_drone1.launch",
         "note": "双机通信"
+    },
+    {
+        "name": "8_cxr_egoctrl",
+        "setup_cmds": ["source ~/racer/devel/setup.bash"],
+        "cd": "",
+        "main_cmd": "rosrun cxr_egoctrl_v1 cxr_egoctrl_v2",
+        "note": "【程控】最后开！！"
     },
     {
         "name": "9_exploration",

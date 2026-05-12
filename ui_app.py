@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-
 """
 Ground station dual-UAV control frontend.
 
@@ -64,7 +63,10 @@ class UAVControlApp(QMainWindow):
         layout.addWidget(title_label)
 
         hint_label = QLabel(
-            "启动/起飞准备：SSH检测、双机基础链路启动、单独触发程控(7)和探索(9)。\n"
+            "当前为手动 SSH 协作模式：先在 VSCode 或终端里分别连上 uav1 / uav2，"
+            "再使用本前端的按钮执行固定远程命令。\n"
+            "检查SSH：只输出两机基础状况（whoami/hostname/tmux 状态）。\n"
+            "启动基础链路：执行远端脚本 python3 /home/hua/双机启动/nuc.py start 和 fly.py start。\n"
             "降落控制：分别控制 1 号机、2 号机，或同时发起双机降落。\n"
             f"（降落请求会连发 {LANDING_REPEAT_COUNT} 次，"
             f"间隔 {int(LANDING_REPEAT_INTERVAL*1000)}ms）"
@@ -73,8 +75,8 @@ class UAVControlApp(QMainWindow):
         layout.addWidget(hint_label)
 
         mission_row = QHBoxLayout()
-        self.check_ssh_button = QPushButton("检查SSH")
-        self.start_basic_button = QPushButton("启动基础链路(1-6/8)")
+        self.check_ssh_button = QPushButton("检查SSH状态")
+        self.start_basic_button = QPushButton("启动基础链路命令")
         self.start_control_button = QPushButton("启动程控(7)")
         self.start_exploration_button = QPushButton("启动探索(9)")
         self.takeoff_seq_button = QPushButton("顺序起飞阶段日志")
@@ -119,7 +121,7 @@ class UAVControlApp(QMainWindow):
 
         self.setCentralWidget(central_widget)
         self.append_log("界面已启动，等待任务指令。")
-        self.append_log("提示：请先在 mission_orchestrator.py 中填写真实 SSH 密码。")
+        self.append_log("提示：当前采用手动 SSH 前置连接模式，按钮会通过 ssh alias 执行固定命令。")
 
     def append_log(self, message):
         """Append one timestamped log line."""
