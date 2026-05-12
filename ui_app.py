@@ -76,10 +76,10 @@ class UAVControlApp(QMainWindow):
 
         mission_row = QHBoxLayout()
         self.check_ssh_button = QPushButton("检查SSH状态")
-        self.start_basic_button = QPushButton("启动基础链路命令")
-        self.start_control_button = QPushButton("启动程控(7)")
+        self.start_basic_button = QPushButton("启动基础链路")
+        self.start_control_button = QPushButton("启动程控(8)")
         self.start_exploration_button = QPushButton("启动探索(9)")
-        self.takeoff_seq_button = QPushButton("顺序起飞阶段日志")
+        self.takeoff_seq_button = QPushButton("顺序阶段起飞日志")
 
         self.check_ssh_button.clicked.connect(self.check_ssh)
         self.start_basic_button.clicked.connect(self.start_basic_chain)
@@ -185,8 +185,8 @@ class UAVControlApp(QMainWindow):
 
     def run_takeoff_sequence(self):
         self._run_background_task(
-            "takeoff_sequence_placeholder",
-            self.mission.run_takeoff_sequence_placeholder,
+            "open_base_chain_terminals",
+            self.mission.open_base_chain_terminals,
         )
 
     def request_landing(self, uav_ids):
