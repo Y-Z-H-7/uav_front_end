@@ -23,7 +23,6 @@ LogFn = Callable[[str], None]
 class DroneConfig:
     display_name: str
     ssh_target: str
-    start_cmd: str
     session_name: str
 
 
@@ -31,16 +30,24 @@ class MissionOrchestrator:
     """Run SSH-based checks and pre-defined remote commands."""
 
     DRONES: Dict[int, DroneConfig] = {
+        # 1: DroneConfig(
+        #     display_name="1号机",
+        #     ssh_target="nvidia@192.168.18.100",
+        #     session_name="nuc_drone",
+        # ),
+        # 2: DroneConfig(
+        #     display_name="2号机",
+        #     ssh_target="nvidia@192.168.18.100",
+        #     session_name="fly_drone",
+        # ),
         1: DroneConfig(
-            display_name="1号机",
-            ssh_target="nvidia@192.168.18.100",
-            start_cmd="python3 /home/hua/双机启动/nuc.py start",
+            display_name="nuc",
+            ssh_target="nuc@192.168.0.121",
             session_name="nuc_drone",
         ),
         2: DroneConfig(
-            display_name="2号机",
-            ssh_target="nvidia@192.168.18.100",
-            start_cmd="python3 /home/hua/双机启动/fly.py start",
+            display_name="fly",
+            ssh_target="fly@192.168.0.195",
             session_name="fly_drone",
         ),
     }
@@ -265,27 +272,52 @@ class MissionOrchestrator:
 
         all_ok = True
         log("[TASK] start_basic_chain 开始")
+        log("[TASK] 基础链路窗口 1-7 自动执行，8-9 仅预置等待手动触发")
+
+        def run_remote_step(drone: DroneConfig, step: str, command: str) -> bool:
+            code, stdout, stderr = self._run_remote_command(
+                drone,
+                command,
+                log=None,
+                context=f"START {drone.display_name}",
+            )
+            if code != 0:
+                detail = stderr or stdout or "no output"
+                log(
+                    f"[TASK] {drone.display_name} {step} 失败 exit_code={code} "
+                    f"detail={detail[:300]}"
+                )
+                return False
+            log(f"[TASK] {drone.display_name} {step} 完成")
+            return True
 
         for drone in self.DRONES.values():
             terms = per_drone_terms.get(drone.session_name)
             if not terms:
+                log(
+                    f"[TASK] {drone.display_name} 未找到 session 配置: "
+                    f"session={drone.session_name}"
+                )
                 all_ok = False
                 continue
 
             last_started_window = terms[0][0]
+            failures = 0
             log(f"[TASK] {drone.display_name} start_basic_chain 开始")
+            log(f"[TASK] {drone.display_name} session={drone.session_name} target={drone.ssh_target}")
 
             first_name, first_setups, first_cd, first_cmd, first_exec = terms[0]
             first_full = build_full_command(first_setups, first_cd, first_cmd)
             first_remote = create_session_command(drone.session_name, first_name)
-            code, _, _ = self._run_remote_command(drone, first_remote, log=None, context=f"START {drone.display_name}")
-            if code != 0:
+            if not run_remote_step(drone, "创建 tmux session", first_remote):
                 all_ok = False
+                failures += 1
             else:
                 start_cmd = f"tmux send-keys -t {shlex.quote(f'{drone.session_name}:0')} {shlex.quote(first_full)} Enter"
-                code, _, _ = self._run_remote_command(drone, start_cmd, log=None, context=f"START {drone.display_name}")
-                if code != 0:
+                log(f"[TASK] {drone.display_name} window={first_name} exec={first_exec} delay={self.FIRST_WINDOW_DELAY_SEC}s")
+                if not run_remote_step(drone, f"启动窗口 {first_name}", start_cmd):
                     all_ok = False
+                    failures += 1
 
             time.sleep(self.FIRST_WINDOW_DELAY_SEC)
 
@@ -293,22 +325,28 @@ class MissionOrchestrator:
                 last_started_window = window_name
                 full_cmd = build_full_command(setups, cd_cmd, main_cmd)
                 remote_cmd = create_window_command(drone.session_name, window_name, full_cmd, execute)
-                code, _, _ = self._run_remote_command(drone, remote_cmd, log=None, context=f"START {drone.display_name}")
-                if code != 0:
+                delay_sec = self.FOLLOWING_WINDOW_DELAY_SEC if idx < 6 else 0
+                log(f"[TASK] {drone.display_name} window={window_name} exec={execute} delay={delay_sec}s")
+                if not run_remote_step(drone, f"准备窗口 {window_name}", remote_cmd):
                     all_ok = False
+                    failures += 1
                 if idx < 6:
                     time.sleep(self.FOLLOWING_WINDOW_DELAY_SEC)
 
             for window_name, setups, cd_cmd, main_cmd, execute in terms[7:9]:
                 full_cmd = build_full_command(setups, cd_cmd, main_cmd)
                 remote_cmd = create_window_command(drone.session_name, window_name, full_cmd, execute)
-                code, _, _ = self._run_remote_command(drone, remote_cmd, log=None, context=f"START {drone.display_name}")
-                if code != 0:
+                log(f"[TASK] {drone.display_name} window={window_name} exec={execute} delay=0s")
+                if not run_remote_step(drone, f"预置窗口 {window_name}", remote_cmd):
                     all_ok = False
+                    failures += 1
 
             session_ok, _ = self._check_session(drone, log=None)
             all_ok = all_ok and session_ok
-            log(f"[TASK] {drone.display_name} start_basic_chain 结束 success={session_ok} window={last_started_window}")
+            log(
+                f"[TASK] {drone.display_name} start_basic_chain 结束 success={session_ok} "
+                f"window={last_started_window} failures={failures}"
+            )
 
         log(f"[TASK] start_basic_chain 结束 success={all_ok}")
         return all_ok

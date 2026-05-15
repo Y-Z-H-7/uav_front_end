@@ -1,8 +1,7 @@
-[2026-05-12 17:47:56] [TASK] started: start_basic_chain
-[2026-05-12 17:47:56] [TASK] start_basic_chain 开始
-[2026-05-12 17:47:56] [TASK] 1号机 start_basic_chain 开始
-[2026-05-12 17:48:22] [TASK] 1号机 start_basic_chain 结束 success=False window=7_bridge
-[2026-05-12 17:48:22] [TASK] 2号机 start_basic_chain 开始
-[2026-05-12 17:48:47] [TASK] 2号机 start_basic_chain 结束 success=False window=7_bridge
-[2026-05-12 17:48:47] [TASK] start_basic_chain 结束 success=False
-[2026-05-12 17:48:47] [TASK] finished: start_basic_chain, success=False
+[2026-05-13 20:08:16] [TASK] started: start_basic_chain
+[2026-05-13 20:08:16] [TASK] start_basic_chain 开始
+[2026-05-13 20:08:16] [TASK] 基础链路窗口 1-7 自动执行，8-9 仅预置等待手动触发
+[2026-05-13 20:08:16] [TASK] nuc 未找到 session 配置: session=nuc_start
+[2026-05-13 20:08:16] [TASK] fly 未找到 session 配置: session=fly_start
+[2026-05-13 20:08:16] [TASK] start_basic_chain 结束 success=False
+[2026-05-13 20:08:16] [TASK] finished: start_basic_chain, success=False
