@@ -11,10 +11,13 @@ Current scope:
 
 import sys
 from datetime import datetime
+from typing import Dict, Optional
 
 from PySide6.QtCore import Qt, QThread, QTimer, Signal
 from PySide6.QtWidgets import (
     QApplication,
+    QGridLayout,
+    QFrame,
     QHBoxLayout,
     QLabel,
     QMainWindow,
@@ -23,6 +26,7 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
+from PySide6.QtGui import QFont
 
 from mission_orchestrator import MissionOrchestrator
 from ros_adapter import RosAdapter, LANDING_REPEAT_COUNT, LANDING_REPEAT_INTERVAL
@@ -56,70 +60,218 @@ class UAVControlApp(QMainWindow):
         self.resize(1100, 850)
 
         central_widget = QWidget()
-        layout = QVBoxLayout(central_widget)
+        main_layout = QHBoxLayout(central_widget)
+
+        self._status_cards: Dict[int, Dict[str, QLabel]] = {}
+        self._latest_ssh_snapshot: Optional[Dict[int, Dict[str, str]]] = None
+
+        # 左侧面板：状态卡 + 操作说明 + 日志
+        left_panel = QVBoxLayout()
 
         title_label = QLabel("双机任务控制前端")
+        title_font = QFont()
+        title_font.setPointSize(18)
+        title_font.setBold(True)
+        title_label.setFont(title_font)
         title_label.setAlignment(Qt.AlignCenter)
-        layout.addWidget(title_label)
+        left_panel.addWidget(title_label)
 
-        hint_label = QLabel(
+        # 状态卡（并排两张）
+        status_frame = QFrame()
+        status_layout = QHBoxLayout(status_frame)
+        status_layout.setSpacing(12)
+        status_layout.setContentsMargins(0, 0, 0, 0)
+
+        def make_status_card(drone_id, name):
+            f = QFrame()
+            f.setObjectName('statusCard')
+            v = QVBoxLayout(f)
+            h = QHBoxLayout()
+            dot = QLabel()
+            dot.setFixedSize(14, 14)
+            dot.setObjectName('statusDot')
+            name_lbl = QLabel(name)
+            name_lbl.setStyleSheet('font-weight:600')
+            h.addWidget(dot)
+            h.addWidget(name_lbl)
+            h.addStretch()
+            v.addLayout(h)
+            info = QLabel('last seen: -')
+            info.setObjectName('statusInfo')
+            v.addWidget(info)
+            self._status_cards[drone_id] = {"dot": dot, "info": info}
+            return f
+
+        status_layout.addWidget(make_status_card(1, 'UAV1'))
+        status_layout.addWidget(make_status_card(2, 'UAV2'))
+        left_panel.addWidget(status_frame)
+
+        # 操作说明
+        hint_box = QTextEdit()
+        hint_box.setReadOnly(True)
+        hint_box.setObjectName('hintBox')
+        hint_box.setHtml(
+            "<b>Operational Guidelines</b><br>"
             "当前为手动 SSH 协作模式：先在 VSCode 或终端里分别连上 uav1 / uav2，"
-            "再使用本前端的按钮执行固定远程命令。\n"
-            "检查SSH：只输出两机基础状况（whoami/hostname/tmux 状态）。\n"
-            "启动基础链路：执行远端脚本 python3 /home/hua/双机启动/nuc.py start 和 fly.py start。\n"
-            "降落控制：分别控制 1 号机、2 号机，或同时发起双机降落。\n"
-            f"（降落请求会连发 {LANDING_REPEAT_COUNT} 次，"
-            f"间隔 {int(LANDING_REPEAT_INTERVAL*1000)}ms）"
+            "再使用本前端的按钮执行固定远程命令。<br>"
+            "检查SSH：只输出两机基础状况（whoami/hostname/tmux 状态）。<br>"
+            "启动基础链路：执行远端脚本 python3 /home/hua/双机启动/nuc.py start 和 fly.py start。<br>"
+            "降落控制：分别控制 1 号机、2 号机，或同时发起双机降落。<br>"
+            f"（降落请求会连发 {LANDING_REPEAT_COUNT} 次，间隔 {int(LANDING_REPEAT_INTERVAL*1000)}ms）"
         )
-        hint_label.setWordWrap(True)
-        layout.addWidget(hint_label)
+        left_panel.addWidget(hint_box)
 
-        mission_row = QHBoxLayout()
+        # 日志区域
+        self.log_view = QTextEdit()
+        self.log_view.setReadOnly(True)
+        self.log_view.setObjectName('logView')
+        self.log_view.setPlaceholderText("任务日志会显示在这里")
+        left_panel.addWidget(self.log_view)
+
+        main_layout.addLayout(left_panel, 2)
+
+        # 右侧面板：分块按钮（辅助 / 地面站 / 飞行控制 + 结束/降落）
+        right_frame = QFrame()
+        right_layout = QVBoxLayout(right_frame)
+        right_layout.setSpacing(14)
+
+        # 辅助功能组
+        aux_frame = QFrame()
+        aux_frame.setObjectName('auxFrame')
+        aux_layout = QHBoxLayout(aux_frame)
+        aux_layout.setSpacing(8)
         self.check_ssh_button = QPushButton("检查SSH状态")
-        self.start_basic_button = QPushButton("启动基础链路")
-        self.start_control_button = QPushButton("启动程控(8)")
-        self.start_exploration_button = QPushButton("启动探索(9)")
+        self.check_ssh_button.setProperty('role','core')
         self.takeoff_seq_button = QPushButton("顺序阶段起飞日志")
+        self.takeoff_seq_button.setProperty('role','core')
+        aux_layout.addWidget(self.check_ssh_button)
+        aux_layout.addWidget(self.takeoff_seq_button)
+        right_layout.addWidget(aux_frame)
 
+        # 地面站组
+        gcs_frame = QFrame()
+        gcs_frame.setObjectName('gcsFrame')
+        gcs_layout = QHBoxLayout(gcs_frame)
+        gcs_layout.setSpacing(8)
+        self.launch_bridge_button = QPushButton("启动 bridge_node_gcs")
+        self.launch_bridge_button.setProperty('role','core')
+        self.launch_exploration_rviz_button = QPushButton("启动 exploration RViz")
+        self.launch_exploration_rviz_button.setProperty('role','core')
+        gcs_layout.addWidget(self.launch_bridge_button)
+        gcs_layout.addWidget(self.launch_exploration_rviz_button)
+        right_layout.addWidget(gcs_frame)
+
+        # 飞行控制组
+        fc_frame = QFrame()
+        fc_frame.setObjectName('fcFrame')
+        fc_grid = QGridLayout(fc_frame)
+        fc_grid.setSpacing(8)
+        self.start_basic_button = QPushButton("启动基础链路")
+        self.start_basic_button.setProperty('role','core')
+        self.start_control_button = QPushButton("启动程控")
+        self.start_control_button.setProperty('role','core')
+        self.start_exploration_button = QPushButton("启动探索")
+        self.start_exploration_button.setProperty('role','core')
+        fc_grid.addWidget(self.start_basic_button, 0, 0)
+        fc_grid.addWidget(self.start_control_button, 0, 1)
+        fc_grid.addWidget(self.start_exploration_button, 1, 0)
+        right_layout.addWidget(fc_frame)
+
+        # 结束任务与降落组（放在底部）
+        end_frame = QFrame()
+        end_frame.setObjectName('endFrame')
+        end_layout = QGridLayout(end_frame)
+        end_layout.setSpacing(8)
+        self.end_uav1_button = QPushButton("结束1号机任务")
+        self.end_uav1_button.setProperty('role','end')
+        self.end_uav2_button = QPushButton("结束2号机任务")
+        self.end_uav2_button.setProperty('role','end')
+        self.land_uav1_button = QPushButton("1号机降落")
+        self.land_uav1_button.setProperty('role','end')
+        self.land_uav2_button = QPushButton("2号机降落")
+        self.land_uav2_button.setProperty('role','end')
+        self.land_both_button = QPushButton("同时降落1和2")
+        self.land_both_button.setProperty('role','end')
+        end_layout.addWidget(self.end_uav1_button, 0, 0)
+        end_layout.addWidget(self.end_uav2_button, 0, 1)
+        end_layout.addWidget(self.land_uav1_button, 1, 0)
+        end_layout.addWidget(self.land_uav2_button, 1, 1)
+        end_layout.addWidget(self.land_both_button, 2, 0, 1, 2)
+        right_layout.addWidget(end_frame)
+
+        main_layout.addWidget(right_frame, 1)
+
+        self.setCentralWidget(central_widget)
+
+        # 重新连接信号（与原逻辑完全保持一致）
         self.check_ssh_button.clicked.connect(self.check_ssh)
         self.start_basic_button.clicked.connect(self.start_basic_chain)
         self.start_control_button.clicked.connect(self.start_control_stage)
         self.start_exploration_button.clicked.connect(self.start_exploration_stage)
         self.takeoff_seq_button.clicked.connect(self.run_takeoff_sequence)
-
-        mission_row.addWidget(self.check_ssh_button)
-        mission_row.addWidget(self.start_basic_button)
-        mission_row.addWidget(self.start_control_button)
-        mission_row.addWidget(self.start_exploration_button)
-        mission_row.addWidget(self.takeoff_seq_button)
-        layout.addLayout(mission_row)
-
-        landing_row = QHBoxLayout()
-        self.land_uav1_button = QPushButton("1号机降落")
-        self.land_uav2_button = QPushButton("2号机降落")
-        self.land_both_button = QPushButton("同时降落1和2")
-
+        self.end_uav1_button.clicked.connect(
+            lambda: self._run_background_task(
+                "end_uav1_task",
+                lambda log: self.mission.terminate_tmux_session(1, log),
+            )
+        )
+        self.end_uav2_button.clicked.connect(
+            lambda: self._run_background_task(
+                "end_uav2_task",
+                lambda log: self.mission.terminate_tmux_session(2, log),
+            )
+        )
+        self.launch_bridge_button.clicked.connect(lambda: self._run_background_task(
+            "launch_bridge", lambda log: self.mission.launch_bridge_node_gcs(log)))
+        self.launch_exploration_rviz_button.clicked.connect(lambda: self._run_background_task(
+            "launch_exploration_rviz", lambda log: self.mission.launch_exploration_rviz(log)))
         self.land_uav1_button.clicked.connect(lambda: self.request_landing([1]))
         self.land_uav2_button.clicked.connect(lambda: self.request_landing([2]))
         self.land_both_button.clicked.connect(lambda: self.request_landing([1, 2]))
 
-        landing_row.addWidget(self.land_uav1_button)
-        landing_row.addWidget(self.land_uav2_button)
-        landing_row.addWidget(self.land_both_button)
-        layout.addLayout(landing_row)
-
-        self.log_view = QTextEdit()
-        self.log_view.setReadOnly(True)
-        self.log_view.setPlaceholderText("任务日志会显示在这里")
-        layout.addWidget(self.log_view)
-
+        # 后端对象保持不变
         self.mission = MissionOrchestrator()
         self.ros_adapter = RosAdapter(self.append_log)
 
         self._task_worker = None
         self._task_in_progress = False
 
-        self.setCentralWidget(central_widget)
+        # 应用深色主题样式表（分组配色：辅助灰、地面站蓝、飞行控制绿、结束/降落红）
+        app = QApplication.instance()
+        dark_style = '''
+QWidget { background: #F7F7F9; color: #1A1A1A; }
+
+/* Component backgrounds */
+QFrame#statusCard { background: #FFFFFF; border: 1px solid #E0E0E0; border-radius: 8px; padding: 8px; }
+QTextEdit#hintBox { background: #FFFFFF; border: 1px solid #E0E0E0; padding: 8px; border-radius:6px; color:#2D3436 }
+QTextEdit#logView { background: #FFFFFF; border: 1px solid #E0E0E0; padding: 8px; border-radius:6px; font-family: Courier New, monospace; color:#4A4A4A }
+
+/* Text colors */
+QLabel { color: #2D3436 }
+
+/* Status indicator default */
+QLabel#statusDot { border-radius: 7px; background: #E0E0E0; }
+
+/* Core action buttons (highlight) */
+QPushButton[role="core"] { background: #3498DB; color: #FFFFFF; min-height: 42px; min-width: 140px; border-radius: 8px; }
+QPushButton[role="core"]:hover { background: #2f85c8 }
+QPushButton[role="core"]:pressed { background: #246ea8 }
+
+/* General / end buttons */
+QPushButton[role="end"] { background: #E0E6ED; color: #4A4A4A; min-height: 42px; min-width: 140px; border-radius: 8px; }
+
+/* Fallback button style */
+QPushButton { background: #E0E6ED; color: #4A4A4A }
+
+/* minor accents */
+QFrame > QPushButton { background: transparent }
+'''
+
+
+        if app:
+            app.setStyleSheet(dark_style)
+
+        self._apply_ssh_snapshot({})
         self.append_log("界面已启动，等待任务指令。")
         self.append_log("提示：当前采用手动 SSH 前置连接模式，按钮会通过 ssh alias 执行固定命令。")
 
@@ -127,6 +279,36 @@ class UAVControlApp(QMainWindow):
         """Append one timestamped log line."""
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         self.log_view.append(f"[{timestamp}] {message}")
+
+    def _set_status_card(self, drone_id: int, connected: bool, info_text: str):
+        card = self._status_cards.get(drone_id)
+        if not card:
+            return
+
+        dot = card["dot"]
+        info = card["info"]
+        color = "#2ECC71" if connected else "#E74C3C"
+        dot.setStyleSheet(f"border-radius: 7px; background: {color};")
+        info.setText(info_text)
+
+    def _apply_ssh_snapshot(self, snapshot: Dict[int, Dict[str, str]]):
+        now_text = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        for drone_id in self.mission.DRONES:
+            item = snapshot.get(drone_id)
+            if not item:
+                self._set_status_card(drone_id, False, "last seen: -\ncore info: unreachable")
+                continue
+
+            connected = item.get("reachable") == "true"
+            user = item.get("user", "-")
+            host = item.get("host", "-")
+            session = item.get("session", "unknown")
+            if connected:
+                info_text = f"last seen: {now_text}\ncore info: {user}@{host}/tmux {session}"
+            else:
+                detail = item.get("detail") or "ssh unreachable"
+                info_text = f"last seen: {now_text}\ncore info: {detail}"
+            self._set_status_card(drone_id, connected, info_text)
 
     def _set_landing_buttons_enabled(self, enabled: bool):
         self.land_uav1_button.setEnabled(enabled)
@@ -139,6 +321,10 @@ class UAVControlApp(QMainWindow):
         self.start_control_button.setEnabled(enabled)
         self.start_exploration_button.setEnabled(enabled)
         self.takeoff_seq_button.setEnabled(enabled)
+        self.end_uav1_button.setEnabled(enabled)
+        self.end_uav2_button.setEnabled(enabled)
+        self.launch_bridge_button.setEnabled(enabled)
+        self.launch_exploration_rviz_button.setEnabled(enabled)
 
     def _clear_worker(self):
         self._task_worker = None
@@ -146,6 +332,8 @@ class UAVControlApp(QMainWindow):
     def _on_task_finished(self, task_name: str, ok: bool):
         self._task_in_progress = False
         self._set_mission_buttons_enabled(True)
+        if task_name == "check_ssh" and self._latest_ssh_snapshot is not None:
+            self._apply_ssh_snapshot(self._latest_ssh_snapshot)
         self.append_log(f"[TASK] finished: {task_name}, success={ok}")
 
     def _run_background_task(self, task_name: str, task_fn):
@@ -166,7 +354,12 @@ class UAVControlApp(QMainWindow):
         worker.start()
 
     def check_ssh(self):
-        self._run_background_task("check_ssh", self.mission.check_ssh_connectivity)
+        def task(log):
+            ok = self.mission.check_ssh_connectivity(log)
+            self._latest_ssh_snapshot = self.mission.collect_ssh_status_snapshot()
+            return ok
+
+        self._run_background_task("check_ssh", task)
 
     def start_basic_chain(self):
         self._run_background_task("start_basic_chain", self.mission.start_basic_chain)
@@ -184,6 +377,21 @@ class UAVControlApp(QMainWindow):
         )
 
     def run_takeoff_sequence(self):
+        """Open attached terminals only if tmux sessions already exist.
+
+        This ensures the operator cannot attach to sessions that have not been
+        created by `start_basic_chain`.
+        """
+        missing = []
+        for drone in self.mission.DRONES.values():
+            session_ok, _ = self.mission._check_session(drone, log=None)
+            if not session_ok:
+                missing.append(drone.display_name)
+
+        if missing:
+            self.append_log(f"[TASK] 未检测到 tmux 会话: {', '.join(missing)}。请先按“启动基础链路”创建会话，然后重试。")
+            return
+
         self._run_background_task(
             "open_base_chain_terminals",
             self.mission.open_base_chain_terminals,
@@ -203,6 +411,7 @@ class UAVControlApp(QMainWindow):
             LANDING_REPEAT_COUNT * LANDING_REPEAT_INTERVAL * 1000
         ) + 1000
         QTimer.singleShot(total_duration_ms, lambda: self._set_landing_buttons_enabled(True))
+
 
 
 def main():

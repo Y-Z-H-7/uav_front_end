@@ -12,6 +12,7 @@ from dataclasses import dataclass
 import shlex
 import subprocess
 import time
+import threading
 from shutil import which
 from typing import Callable, Dict, List, Optional, Tuple
 
@@ -30,26 +31,26 @@ class MissionOrchestrator:
     """Run SSH-based checks and pre-defined remote commands."""
 
     DRONES: Dict[int, DroneConfig] = {
-        # 1: DroneConfig(
-        #     display_name="1号机",
-        #     ssh_target="nvidia@192.168.18.100",
-        #     session_name="nuc_drone",
-        # ),
-        # 2: DroneConfig(
-        #     display_name="2号机",
-        #     ssh_target="nvidia@192.168.18.100",
-        #     session_name="fly_drone",
-        # ),
         1: DroneConfig(
-            display_name="nuc",
-            ssh_target="nuc@192.168.0.121",
+            display_name="1号机",
+            ssh_target="nvidia@192.168.18.100",
             session_name="nuc_drone",
         ),
         2: DroneConfig(
-            display_name="fly",
-            ssh_target="fly@192.168.0.195",
+            display_name="2号机",
+            ssh_target="nvidia@192.168.18.100",
             session_name="fly_drone",
         ),
+        # 1: DroneConfig(
+        #     display_name="nuc",
+        #     ssh_target="nuc@192.168.0.121",
+        #     session_name="nuc_drone",
+        # ),
+        # 2: DroneConfig(
+        #     display_name="fly",
+        #     ssh_target="fly@192.168.0.195",
+        #     session_name="fly_drone",
+        # ),
     }
 
     SSH_CONNECT_TIMEOUT_SEC = 8
@@ -142,6 +143,39 @@ class MissionOrchestrator:
         exists = state == "0"
         return exists, f"tmux session={drone.session_name} exists={exists}"
 
+    def _cleanup_named_tmux_sessions(self, log: LogFn) -> int:
+        """Best-effort cleanup for known tmux session names before startup."""
+        cleared = 0
+        for drone in self.DRONES.values():
+            remote_command = (
+                f"if tmux has-session -t {shlex.quote(drone.session_name)} >/dev/null 2>&1; then "
+                f"tmux kill-session -t {shlex.quote(drone.session_name)}; "
+                "echo cleaned; "
+                "else echo missing; fi"
+            )
+            code, out, err = self._run_remote_command(
+                drone,
+                remote_command,
+                log=None,
+                context=f"CLEANUP {drone.display_name}",
+            )
+            if code != 0:
+                detail = err or out or "no output"
+                log(
+                    f"[TASK] {drone.display_name} 预清理失败 exit_code={code} "
+                    f"detail={detail[:300]}"
+                )
+                continue
+
+            state = out.splitlines()[-1].strip() if out else "missing"
+            if state == "cleaned":
+                cleared += 1
+                log(f"[TASK] {drone.display_name} 预清理: 已清除旧会话 {drone.session_name}")
+            else:
+                log(f"[TASK] {drone.display_name} 预清理: 无旧会话 {drone.session_name}")
+
+        return cleared
+
     def _launch_local_terminal(self, remote_command: str, log: Optional[LogFn] = None) -> Tuple[int, str, str]:
         launchers = [
             ["gnome-terminal", "--", "bash", "-lc", remote_command],
@@ -174,6 +208,47 @@ class MissionOrchestrator:
         if log is not None:
             log("[ATTACH] no supported terminal emulator found")
         return 127, "", "no supported terminal emulator found"
+
+    def collect_ssh_status_snapshot(self) -> Dict[int, Dict[str, str]]:
+        """Collect lightweight SSH/session status for UI cards."""
+        snapshot: Dict[int, Dict[str, str]] = {}
+        for drone_id, drone in self.DRONES.items():
+            status = {
+                "display_name": drone.display_name,
+                "ssh_target": drone.ssh_target,
+                "reachable": "false",
+                "user": "-",
+                "host": "-",
+                "session": "unknown",
+                "detail": "",
+            }
+
+            code, out, err = self._run_remote_command(
+                drone,
+                self._probe_summary(drone),
+                log=None,
+                context=f"SSH-SNAPSHOT {drone.display_name}",
+            )
+            if code == 0:
+                status["reachable"] = "true"
+                for line in (out or "").splitlines():
+                    line = line.strip()
+                    if line.startswith("user="):
+                        status["user"] = line.split("=", 1)[1] or "-"
+                    elif line.startswith("host="):
+                        status["host"] = line.split("=", 1)[1] or "-"
+                    elif line.startswith("tmux_session="):
+                        raw = line.split("=", 1)[1]
+                        if raw.endswith(":present"):
+                            status["session"] = "present"
+                        elif raw == "missing":
+                            status["session"] = "missing"
+            else:
+                status["detail"] = (err or out or "ssh_unreachable")[:300]
+
+            snapshot[drone_id] = status
+
+        return snapshot
 
     def check_ssh_connectivity(self, log: LogFn) -> bool:
         all_ok = True
@@ -270,9 +345,14 @@ class MissionOrchestrator:
             ],
         }
 
-        all_ok = True
         log("[TASK] start_basic_chain 开始")
-        log("[TASK] 基础链路窗口 1-7 自动执行，8-9 仅预置等待手动触发")
+        log("[TASK] 基础链路将按无人机并行启动；单机内部窗口仍保持串行执行")
+
+        cleared_count = self._cleanup_named_tmux_sessions(log)
+        log(f"[TASK] 预清理完成：共清除 {cleared_count} 个同名 tmux 会话")
+
+        results = {}
+        results_lock = threading.Lock()
 
         def run_remote_step(drone: DroneConfig, step: str, command: str) -> bool:
             code, stdout, stderr = self._run_remote_command(
@@ -291,15 +371,14 @@ class MissionOrchestrator:
             log(f"[TASK] {drone.display_name} {step} 完成")
             return True
 
-        for drone in self.DRONES.values():
+        def run_drone_chain(drone: DroneConfig) -> bool:
             terms = per_drone_terms.get(drone.session_name)
             if not terms:
                 log(
                     f"[TASK] {drone.display_name} 未找到 session 配置: "
                     f"session={drone.session_name}"
                 )
-                all_ok = False
-                continue
+                return False
 
             last_started_window = terms[0][0]
             failures = 0
@@ -310,13 +389,11 @@ class MissionOrchestrator:
             first_full = build_full_command(first_setups, first_cd, first_cmd)
             first_remote = create_session_command(drone.session_name, first_name)
             if not run_remote_step(drone, "创建 tmux session", first_remote):
-                all_ok = False
                 failures += 1
             else:
                 start_cmd = f"tmux send-keys -t {shlex.quote(f'{drone.session_name}:0')} {shlex.quote(first_full)} Enter"
                 log(f"[TASK] {drone.display_name} window={first_name} exec={first_exec} delay={self.FIRST_WINDOW_DELAY_SEC}s")
                 if not run_remote_step(drone, f"启动窗口 {first_name}", start_cmd):
-                    all_ok = False
                     failures += 1
 
             time.sleep(self.FIRST_WINDOW_DELAY_SEC)
@@ -328,7 +405,6 @@ class MissionOrchestrator:
                 delay_sec = self.FOLLOWING_WINDOW_DELAY_SEC if idx < 6 else 0
                 log(f"[TASK] {drone.display_name} window={window_name} exec={execute} delay={delay_sec}s")
                 if not run_remote_step(drone, f"准备窗口 {window_name}", remote_cmd):
-                    all_ok = False
                     failures += 1
                 if idx < 6:
                     time.sleep(self.FOLLOWING_WINDOW_DELAY_SEC)
@@ -338,16 +414,31 @@ class MissionOrchestrator:
                 remote_cmd = create_window_command(drone.session_name, window_name, full_cmd, execute)
                 log(f"[TASK] {drone.display_name} window={window_name} exec={execute} delay=0s")
                 if not run_remote_step(drone, f"预置窗口 {window_name}", remote_cmd):
-                    all_ok = False
                     failures += 1
 
             session_ok, _ = self._check_session(drone, log=None)
-            all_ok = all_ok and session_ok
+            success = session_ok and failures == 0
             log(
-                f"[TASK] {drone.display_name} start_basic_chain 结束 success={session_ok} "
+                f"[TASK] {drone.display_name} start_basic_chain 结束 success={success} "
                 f"window={last_started_window} failures={failures}"
             )
+            return success
 
+        def worker(drone: DroneConfig) -> None:
+            result = run_drone_chain(drone)
+            with results_lock:
+                results[drone.session_name] = result
+
+        threads = []
+        for drone in self.DRONES.values():
+            thread = threading.Thread(target=worker, args=(drone,), daemon=True)
+            threads.append(thread)
+            thread.start()
+
+        for thread in threads:
+            thread.join()
+
+        all_ok = all(results.get(drone.session_name, False) for drone in self.DRONES.values())
         log(f"[TASK] start_basic_chain 结束 success={all_ok}")
         return all_ok
 
@@ -401,6 +492,86 @@ class MissionOrchestrator:
 
         log(f"[TASK] trigger_manual_stage({stage}) 结束 success={all_ok}")
         return all_ok
+
+    def terminate_tmux_session(self, drone_id: int, log: LogFn) -> bool:
+        """Terminate one drone tmux session and all processes inside it."""
+        drone = self.DRONES.get(drone_id)
+        if drone is None:
+            log(f"[TASK] unknown drone id: {drone_id}")
+            return False
+
+        log(f"[TASK] terminate_tmux_session({drone.display_name}) 开始")
+        remote_command = (
+            f"if tmux has-session -t {shlex.quote(drone.session_name)} >/dev/null 2>&1; then "
+            f"tmux kill-session -t {shlex.quote(drone.session_name)} && echo result=terminated || echo result=kill_failed; "
+            "else echo result=already_absent; fi; "
+            f"if tmux has-session -t {shlex.quote(drone.session_name)} >/dev/null 2>&1; then "
+            "echo verify=present; "
+            "else echo verify=gone; fi"
+        )
+        code, stdout, stderr = self._run_remote_command(
+            drone,
+            remote_command,
+            log=None,
+            context=f"STOP {drone.display_name}",
+        )
+        if code != 0:
+            detail = stderr or stdout or "no output"
+            log(
+                f"[TASK] {drone.display_name} 结束任务失败 exit_code={code} "
+                f"detail={detail[:300]}"
+            )
+            return False
+
+        result = "unknown"
+        verify = "unknown"
+        for line in (stdout or "").splitlines():
+            line = line.strip()
+            if line.startswith("result="):
+                result = line.split("=", 1)[1]
+            elif line.startswith("verify="):
+                verify = line.split("=", 1)[1]
+
+        if result == "terminated" and verify == "gone":
+            log(f"[TASK] {drone.display_name} 结束任务结果: 已清理会话 {drone.session_name}")
+            return True
+
+        if result == "already_absent" and verify == "gone":
+            log(f"[TASK] {drone.display_name} 结束任务结果: 会话原本不存在（视为已结束）")
+            return True
+
+        detail = (stderr or stdout or "no output")[:300]
+        log(
+            f"[TASK] {drone.display_name} 结束任务异常 result={result} verify={verify} "
+            f"detail={detail}"
+        )
+        return False
+
+
+    def launch_bridge_node_gcs(self, log: LogFn) -> bool:
+        """Launch local terminal running bridge_node_gcs launch."""
+        cmd = "source ~/swarm_ros_bridge_ws/devel/setup.bash && roslaunch swarm_ros_bridge bridge_node_gcs.launch"
+        remote_command = f"bash -lc {shlex.quote(cmd)}"
+        code, out, err = self._launch_local_terminal(remote_command, log=log)
+        if code != 0:
+            log(f"[LAUNCH] bridge_node_gcs 启动失败 code={code} err={err or out}")
+            return False
+        log("[LAUNCH] bridge_node_gcs 已在本地终端启动")
+        return True
+
+    def launch_exploration_rviz(self, log: LogFn) -> bool:
+        """Launch local terminal running exploration RViz."""
+        cmd = "source ~/racer/devel/setup.bash && roslaunch exploration_manager rviz.launch"
+        remote_command = f"bash -lc {shlex.quote(cmd)}"
+        code, out, err = self._launch_local_terminal(remote_command, log=log)
+        if code != 0:
+            log(f"[LAUNCH] exploration RViz 启动失败 code={code} err={err or out}")
+            return False
+        log("[LAUNCH] exploration RViz 已在本地终端启动")
+        return True
+
+        log(f"[TASK] {drone.display_name} 结束任务完成")
+        return True
 
     def run_takeoff_sequence_placeholder(self, log: LogFn) -> bool:
         """Placeholder for sequential takeoff flow logging.
