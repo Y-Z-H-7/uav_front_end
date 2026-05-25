@@ -58,6 +58,15 @@ class MissionOrchestrator:
     FIRST_WINDOW_DELAY_SEC = 7
     FOLLOWING_WINDOW_DELAY_SEC = 3
 
+    def __init__(
+        self,
+        manual_stage_start_order: Tuple[int, int] = (2, 1),
+        manual_stage_start_delay_sec: float = 1.0,
+    ) -> None:
+        # Only affects the manual stage buttons (control/exploration).
+        self.manual_stage_start_order = manual_stage_start_order
+        self.manual_stage_start_delay_sec = manual_stage_start_delay_sec
+
     def _format_exception(self, exc: Exception) -> str:
         return f"{type(exc).__name__}: {exc}"
 
@@ -296,7 +305,7 @@ class MissionOrchestrator:
         def build_full_command(setups, cd_cmd, main_cmd):
             parts = [*setups]
             if cd_cmd:
-                parts.append(f"cd {cd_cmd}")
+                parts.append(f"{cd_cmd}")
             parts.append(main_cmd)
             return " && ".join(parts)
 
@@ -478,17 +487,25 @@ class MissionOrchestrator:
 
         all_ok = True
         log(f"[TASK] trigger_manual_stage({stage}) 开始")
-        for drone in self.DRONES.values():
+        ordered_drone_ids = [drone_id for drone_id in self.manual_stage_start_order if drone_id in self.DRONES]
+        if len(ordered_drone_ids) != len(self.DRONES):
+            remaining_ids = [drone_id for drone_id in self.DRONES if drone_id not in ordered_drone_ids]
+            ordered_drone_ids.extend(remaining_ids)
+
+        for index, drone_id in enumerate(ordered_drone_ids):
+            drone = self.DRONES[drone_id]
             session_ok, _ = self._check_session(drone, log=None)
             if not session_ok:
                 all_ok = False
-                continue
+            else:
+                target = f"{drone.session_name}:{window_name}"
+                cmd = f"tmux send-keys -t {shlex.quote(target)} Enter"
+                code, _, _ = self._run_remote_command(drone, cmd, log=None, context=f"TASK {drone.display_name}")
+                if code != 0:
+                    all_ok = False
 
-            target = f"{drone.session_name}:{window_name}"
-            cmd = f"tmux send-keys -t {shlex.quote(target)} Enter"
-            code, _, _ = self._run_remote_command(drone, cmd, log=None, context=f"TASK {drone.display_name}")
-            if code != 0:
-                all_ok = False
+            if index == 0 and len(ordered_drone_ids) > 1 and self.manual_stage_start_delay_sec > 0:
+                time.sleep(self.manual_stage_start_delay_sec)
 
         log(f"[TASK] trigger_manual_stage({stage}) 结束 success={all_ok}")
         return all_ok
