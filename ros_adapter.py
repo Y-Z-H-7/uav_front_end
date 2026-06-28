@@ -92,6 +92,7 @@ class RosAdapter:
         self.landing_topics = landing_topics or {
             1: "/uav1/mission/land_request",
             2: "/uav2/mission/land_request",
+            3: "/uav3/mission/land_request",
         }
 
         self.publishers = {}
@@ -137,7 +138,7 @@ class RosAdapter:
         改进点：
         - 连发10次（间隔100ms）抵抗UDP丢包
         - 使用QThread异步发送，UI不卡顿
-        - 多机并发：1+2号机同时下发指令
+        - 多机并发：各机同时下发指令
         """
         requested_ids = list(uav_ids)
         if not requested_ids:

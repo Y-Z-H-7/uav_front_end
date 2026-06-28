@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
-"""Mission orchestration for manual SSH-driven dual-UAV startup.
+"""Mission orchestration for manual SSH-driven multi-UAV startup.
 
 The front-end no longer stores SSH passwords or opens remote sessions itself.
 Instead it runs the local ``ssh`` client against preconfigured host aliases
-such as ``uav1`` and ``uav2``. That keeps the UI focused on two tasks only:
+such as ``uav1``, ``uav2`` and ``uav3``. Window definitions are stored per-drone
+in DroneConfig.windows, making it easy to add new drones with different commands.
 1. Check basic SSH reachability and print a short status summary.
 2. Dispatch the exact remote commands requested by the operator.
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import shlex
 import subprocess
 import time
@@ -21,36 +22,94 @@ LogFn = Callable[[str], None]
 
 
 @dataclass(frozen=True)
+class WindowDef:
+    """Definition of a single tmux window inside a drone session."""
+
+    name: str
+    setups: Tuple[str, ...] = ()
+    cd_cmd: str = ""
+    main_cmd: str = ""
+    execute: bool = True
+
+
+@dataclass(frozen=True)
 class DroneConfig:
     display_name: str
     ssh_target: str
     session_name: str
+    windows: Tuple[WindowDef, ...] = ()
 
 
 class MissionOrchestrator:
     """Run SSH-based checks and pre-defined remote commands."""
 
+    # Shared PX4 command for nuc / fly (password-sudo).
+    _PX4_CMD_NUC_FLY = (
+        "echo 8888 | sudo -S bash -c "
+        "'source /opt/ros/noetic/setup.bash && "
+        "if [ -e /dev/ttyACM0 ]; then chmod 777 /dev/ttyACM0; fi && "
+        "roslaunch mavros px4.launch'"
+    )
+
+    # PX4 command for nuc2 (passwordless sudo).
+    _PX4_CMD_NUC2 = (
+        "sudo chmod 777 /dev/ttyACM0 && "
+        "source /opt/ros/noetic/setup.bash && "
+        "roslaunch mavros px4.launch"
+    )
+
     DRONES: Dict[int, DroneConfig] = {
         1: DroneConfig(
-            display_name="1号机",
+            display_name="nuc",
+            # ssh_target="nuc@192.168.0.121",
             ssh_target="nvidia@192.168.18.100",
             session_name="nuc_drone",
+            windows=(
+                WindowDef("1_px4", main_cmd=_PX4_CMD_NUC_FLY, execute=True),
+                WindowDef("2_livox", main_cmd="roslaunch livox_ros_driver2 msg_MID360.launch", execute=True),
+                WindowDef("3_fastlio", main_cmd="roslaunch fast_lio mapping_mid360.launch", execute=True),
+                WindowDef("4_offb_node", setups=("source ~/racer/devel/setup.bash",), main_cmd="rosrun cxr_egoctrl_v1 offb_node", execute=True),
+                WindowDef("5_ego_transfer", cd_cmd="cd ~/racer/src/scripts", main_cmd="python3 ego_transfer.py", execute=True),
+                WindowDef("6_trans", setups=("source ~/racer/devel/setup.bash",), main_cmd="rosrun cxr_egoctrl_v1 trans.py", execute=True),
+                WindowDef("7_bridge", setups=("source ~/swarm_ros_bridge_ws/devel/setup.bash",), main_cmd="roslaunch swarm_ros_bridge bridge_drone1.launch", execute=True),
+                WindowDef("8_cxr_egoctrl", setups=("source ~/racer/devel/setup.bash",), main_cmd="rosrun cxr_egoctrl_v1 cxr_egoctrl_v2", execute=False),
+                WindowDef("9_exploration", setups=("source ~/racer/devel/setup.bash",), main_cmd="roslaunch exploration_manager swarm_exploration_realworld.launch 2>&1 | tee '/home/nuc/文档/swarm$(date +%Y%m%d%H%M%S).log'", execute=False),
+            ),
         ),
         2: DroneConfig(
-            display_name="2号机",
+            display_name="fly",
+            #ssh_target="fly@192.168.0.195",
             ssh_target="nvidia@192.168.18.100",
             session_name="fly_drone",
+            windows=(
+                WindowDef("1_px4", main_cmd=_PX4_CMD_NUC_FLY, execute=True),
+                WindowDef("2_livox", main_cmd="roslaunch livox_ros_driver2 msg_MID360.launch", execute=True),
+                WindowDef("3_fastlio", main_cmd="roslaunch fast_lio mapping_mid360.launch", execute=True),
+                WindowDef("4_offb_node", setups=("source ~/racer/devel/setup.bash",), main_cmd="rosrun cxr_egoctrl_v1 offb_node", execute=True),
+                WindowDef("5_ego_transfer", cd_cmd="cd ~/racer/src/scripts", main_cmd="python3 ego_transfer.py", execute=True),
+                WindowDef("6_trans", setups=("source ~/racer/devel/setup.bash",), main_cmd="rosrun cxr_egoctrl_v1 trans.py", execute=True),
+                WindowDef("7_bridge", setups=("source ~/swarm_ros_bridge_ws/devel/setup.bash",), main_cmd="roslaunch swarm_ros_bridge bridge_drone2.launch", execute=True),
+                WindowDef("8_cxr_egoctrl", setups=("source ~/racer/devel/setup.bash",), main_cmd="rosrun cxr_egoctrl_v1 cxr_egoctrl_v2", execute=False),
+                WindowDef("9_exploration", setups=("source ~/racer/devel/setup.bash",), main_cmd="roslaunch exploration_manager swarm_exploration_realworld.launch 2>&1 | tee '/home/fly/Music/swarm$(date +%Y%m%d%H%M%S).log'", execute=False),
+            ),
         ),
-        # 1: DroneConfig(
-        #     display_name="nuc",
-        #     ssh_target="nuc@192.168.0.121",
-        #     session_name="nuc_drone",
-        # ),
-        # 2: DroneConfig(
-        #     display_name="fly",
-        #     ssh_target="fly@192.168.0.195",
-        #     session_name="fly_drone",
-        # ),
+        3: DroneConfig(
+            display_name="nuc2",
+            #ssh_target="nuc2@192.168.0.X",
+            ssh_target="nvidia@192.168.18.100",
+            session_name="nuc2_drone",
+            windows=(
+                WindowDef("1_px4", main_cmd=_PX4_CMD_NUC2, execute=True),
+                WindowDef("2_livox", setups=("cd ~/ws_livox", "source devel/setup.bash"), main_cmd="roslaunch livox_ros_driver2 msg_MID360s.launch", execute=True),
+                WindowDef("3_fastlio", setups=("cd ~/fast_lio_ws", "source ~/fast_lio_ws/devel/setup.bash"), main_cmd="roslaunch fast_lio mapping_mid360s.launch", execute=True),
+                WindowDef("4_offb_node", setups=("source ~/racer/devel/setup.bash",), main_cmd="rosrun cxr_egoctrl_v1 offb_node", execute=True),
+                WindowDef("5_ego_transfer", cd_cmd="cd ~/racer/src/scripts", main_cmd="python3 ego_transfer.py", execute=True),
+                WindowDef("6_trans", setups=("chmod +x /home/nuc2/racer/src/control/src/trans.py", "source ~/racer/devel/setup.bash"), main_cmd="rosrun cxr_egoctrl_v1 trans.py", execute=True),
+                WindowDef("7_bridge", setups=("source ~/swarm_ros_bridge_ws/devel/setup.bash",), main_cmd="roslaunch swarm_ros_bridge bridge_drone3.launch", execute=True),
+                WindowDef("8_cxr_egoctrl", setups=("source ~/racer/devel/setup.bash",), main_cmd="rosrun cxr_egoctrl_v1 cxr_egoctrl_v2", execute=False),
+                WindowDef("9_exploration", setups=("source ~/racer/devel/setup.bash",), main_cmd="roslaunch exploration_manager swarm_exploration_realworld.launch 2>&1 | tee '/home/nuc2/文档/swarm$(date +%Y%m%d%H%M%S).log'", execute=False),
+            ),
+        ),
     }
 
     SSH_CONNECT_TIMEOUT_SEC = 8
@@ -60,7 +119,7 @@ class MissionOrchestrator:
 
     def __init__(
         self,
-        manual_stage_start_order: Tuple[int, int] = (2, 1),
+        manual_stage_start_order: Tuple[int, int, int] = (2, 1, 3),
         manual_stage_start_delay_sec: float = 1.0,
     ) -> None:
         # Only affects the manual stage buttons (control/exploration).
@@ -262,7 +321,7 @@ class MissionOrchestrator:
     def check_ssh_connectivity(self, log: LogFn) -> bool:
         all_ok = True
         log("[SSH] 基础状况检查开始")
-        log("[SSH] 当前使用手动 SSH 模式：请先在 VSCode 或 ~/.ssh/config 中准备好 uav1/uav2")
+        log("[SSH] 当前使用手动 SSH 模式：请先在 VSCode 或 ~/.ssh/config 中配置好各无人机 SSH 别名")
         for drone in self.DRONES.values():
             code, out, err = self._run_remote_command(
                 drone,
@@ -292,15 +351,8 @@ class MissionOrchestrator:
 
         Window 1 waits 7 seconds before window 2; all later windows wait 3 seconds.
         Windows 8 and 9 are prepared but not executed here.
+        Windows definitions are read from each drone's ``windows`` tuple.
         """
-
-        def px4_cmd() -> str:
-            return (
-                "echo 8888 | sudo -S bash -c "
-                "'source /opt/ros/noetic/setup.bash && "
-                "if [ -e /dev/ttyACM0 ]; then chmod 777 /dev/ttyACM0; fi && "
-                "roslaunch mavros px4.launch'"
-            )
 
         def build_full_command(setups, cd_cmd, main_cmd):
             parts = [*setups]
@@ -329,33 +381,8 @@ class MissionOrchestrator:
                 f"tmux send-keys -t {quoted_target} {shlex.quote(command)}"
             )
 
-        per_drone_terms = {
-            "nuc_drone": [
-                ("1_px4", [], "", px4_cmd(), True),
-                ("2_livox", [], "", "roslaunch livox_ros_driver2 msg_MID360.launch", True),
-                ("3_fastlio", [], "", "roslaunch fast_lio mapping_mid360.launch", True),
-                ("4_offb_node", ["source ~/racer/devel/setup.bash"], "", "rosrun cxr_egoctrl_v1 offb_node", True),
-                ("5_ego_transfer", [], "cd ~/racer/src/scripts", "python3 ego_transfer.py", True),
-                ("6_trans", ["source ~/racer/devel/setup.bash"], "", "rosrun cxr_egoctrl_v1 trans.py", True),
-                ("7_bridge", ["source ~/swarm_ros_bridge_ws/devel/setup.bash"], "", "roslaunch swarm_ros_bridge bridge_drone1.launch", True),
-                ("8_cxr_egoctrl", ["source ~/racer/devel/setup.bash"], "", "rosrun cxr_egoctrl_v1 cxr_egoctrl_v2", False),
-                ("9_exploration", ["source ~/racer/devel/setup.bash"], "", "roslaunch exploration_manager swarm_exploration_realworld.launch 2>&1 | tee '/home/nuc/文档/swarm$(date +%Y%m%d%H%M%S).log'", False),
-            ],
-            "fly_drone": [
-                ("1_px4", [], "", px4_cmd(), True),
-                ("2_livox", [], "", "roslaunch livox_ros_driver2 msg_MID360.launch", True),
-                ("3_fastlio", [], "", "roslaunch fast_lio mapping_mid360.launch", True),
-                ("4_offb_node", ["source ~/racer/devel/setup.bash"], "", "rosrun cxr_egoctrl_v1 offb_node", True),
-                ("5_ego_transfer", [], "cd ~/racer/src/scripts", "python3 ego_transfer.py", True),
-                ("6_trans", ["source ~/racer/devel/setup.bash"], "", "rosrun cxr_egoctrl_v1 trans.py", True),
-                ("7_bridge", ["source ~/swarm_ros_bridge_ws/devel/setup.bash"], "", "roslaunch swarm_ros_bridge bridge_drone2.launch", True),
-                ("8_cxr_egoctrl", ["source ~/racer/devel/setup.bash"], "", "rosrun cxr_egoctrl_v1 cxr_egoctrl_v2", False),
-                ("9_exploration", ["source ~/racer/devel/setup.bash"], "", "roslaunch exploration_manager swarm_exploration_realworld.launch 2>&1 | tee '/home/fly/Music/swarm$(date +%Y%m%d%H%M%S).log'", False),
-            ],
-        }
-
         log("[TASK] start_basic_chain 开始")
-        log("[TASK] 基础链路将按无人机并行启动；单机内部窗口仍保持串行执行")
+        log(f"[TASK] 基础链路将按 {len(self.DRONES)} 架无人机并行启动；单机内部窗口仍保持串行执行")
 
         cleared_count = self._cleanup_named_tmux_sessions(log)
         log(f"[TASK] 预清理完成：共清除 {cleared_count} 个同名 tmux 会话")
@@ -381,48 +408,48 @@ class MissionOrchestrator:
             return True
 
         def run_drone_chain(drone: DroneConfig) -> bool:
-            terms = per_drone_terms.get(drone.session_name)
+            terms = drone.windows
             if not terms:
                 log(
-                    f"[TASK] {drone.display_name} 未找到 session 配置: "
+                    f"[TASK] {drone.display_name} 未找到窗口配置: "
                     f"session={drone.session_name}"
                 )
                 return False
 
-            last_started_window = terms[0][0]
+            last_started_window = terms[0].name
             failures = 0
             log(f"[TASK] {drone.display_name} start_basic_chain 开始")
             log(f"[TASK] {drone.display_name} session={drone.session_name} target={drone.ssh_target}")
 
-            first_name, first_setups, first_cd, first_cmd, first_exec = terms[0]
-            first_full = build_full_command(first_setups, first_cd, first_cmd)
-            first_remote = create_session_command(drone.session_name, first_name)
+            first = terms[0]
+            first_full = build_full_command(first.setups, first.cd_cmd, first.main_cmd)
+            first_remote = create_session_command(drone.session_name, first.name)
             if not run_remote_step(drone, "创建 tmux session", first_remote):
                 failures += 1
             else:
                 start_cmd = f"tmux send-keys -t {shlex.quote(f'{drone.session_name}:0')} {shlex.quote(first_full)} Enter"
-                log(f"[TASK] {drone.display_name} window={first_name} exec={first_exec} delay={self.FIRST_WINDOW_DELAY_SEC}s")
-                if not run_remote_step(drone, f"启动窗口 {first_name}", start_cmd):
+                log(f"[TASK] {drone.display_name} window={first.name} exec={first.execute} delay={self.FIRST_WINDOW_DELAY_SEC}s")
+                if not run_remote_step(drone, f"启动窗口 {first.name}", start_cmd):
                     failures += 1
 
             time.sleep(self.FIRST_WINDOW_DELAY_SEC)
 
-            for idx, (window_name, setups, cd_cmd, main_cmd, execute) in enumerate(terms[1:7], start=1):
-                last_started_window = window_name
-                full_cmd = build_full_command(setups, cd_cmd, main_cmd)
-                remote_cmd = create_window_command(drone.session_name, window_name, full_cmd, execute)
+            for idx, w in enumerate(terms[1:7], start=1):
+                last_started_window = w.name
+                full_cmd = build_full_command(w.setups, w.cd_cmd, w.main_cmd)
+                remote_cmd = create_window_command(drone.session_name, w.name, full_cmd, w.execute)
                 delay_sec = self.FOLLOWING_WINDOW_DELAY_SEC if idx < 6 else 0
-                log(f"[TASK] {drone.display_name} window={window_name} exec={execute} delay={delay_sec}s")
-                if not run_remote_step(drone, f"准备窗口 {window_name}", remote_cmd):
+                log(f"[TASK] {drone.display_name} window={w.name} exec={w.execute} delay={delay_sec}s")
+                if not run_remote_step(drone, f"准备窗口 {w.name}", remote_cmd):
                     failures += 1
                 if idx < 6:
                     time.sleep(self.FOLLOWING_WINDOW_DELAY_SEC)
 
-            for window_name, setups, cd_cmd, main_cmd, execute in terms[7:9]:
-                full_cmd = build_full_command(setups, cd_cmd, main_cmd)
-                remote_cmd = create_window_command(drone.session_name, window_name, full_cmd, execute)
-                log(f"[TASK] {drone.display_name} window={window_name} exec={execute} delay=0s")
-                if not run_remote_step(drone, f"预置窗口 {window_name}", remote_cmd):
+            for w in terms[7:9]:
+                full_cmd = build_full_command(w.setups, w.cd_cmd, w.main_cmd)
+                remote_cmd = create_window_command(drone.session_name, w.name, full_cmd, w.execute)
+                log(f"[TASK] {drone.display_name} window={w.name} exec={w.execute} delay=0s")
+                if not run_remote_step(drone, f"预置窗口 {w.name}", remote_cmd):
                     failures += 1
 
             session_ok, _ = self._check_session(drone, log=None)
@@ -452,7 +479,7 @@ class MissionOrchestrator:
         return all_ok
 
     def open_base_chain_terminals(self, log: LogFn) -> bool:
-        """Open local attached terminals for both drone tmux sessions."""
+        """Open local attached terminals for all drone tmux sessions."""
         all_ok = True
         log("[TASK] open_base_chain_terminals 开始")
         for drone in self.DRONES.values():
@@ -585,9 +612,6 @@ class MissionOrchestrator:
             log(f"[LAUNCH] exploration RViz 启动失败 code={code} err={err or out}")
             return False
         log("[LAUNCH] exploration RViz 已在本地终端启动")
-        return True
-
-        log(f"[TASK] {drone.display_name} 结束任务完成")
         return True
 
     def run_takeoff_sequence_placeholder(self, log: LogFn) -> bool:
