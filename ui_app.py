@@ -65,6 +65,11 @@ class UAVControlApp(QMainWindow):
 
         self._status_cards: Dict[int, Dict[str, QLabel]] = {}
         self._latest_ssh_snapshot: Optional[Dict[int, Dict[str, str]]] = None
+        self._early_logs: list = []  # buffered before log_view exists
+
+        # 后端对象（状态卡片创建时需要引用 drone 配置）
+        self.mission = MissionOrchestrator()
+        self.ros_adapter = RosAdapter(self.append_log)
 
         # 左侧面板：状态卡 + 操作说明 + 日志
         left_panel = QVBoxLayout()
@@ -83,12 +88,12 @@ class UAVControlApp(QMainWindow):
         status_layout.setSpacing(12)
         status_layout.setContentsMargins(0, 0, 0, 0)
 
-        def make_status_card(drone_id, name):
+        def make_status_card(drone_id, display, ip):
             f = QFrame()
             f.setObjectName('statusCard')
             # Prevent card from growing beyond its fair share of horizontal space
             f.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
-            f.setMinimumWidth(180)
+            f.setMinimumWidth(220)
             f.setMaximumHeight(80)
             v = QVBoxLayout(f)
             v.setContentsMargins(6, 4, 6, 4)
@@ -97,10 +102,16 @@ class UAVControlApp(QMainWindow):
             dot = QLabel()
             dot.setFixedSize(14, 14)
             dot.setObjectName('statusDot')
-            name_lbl = QLabel(name)
+            name_lbl = QLabel(display)
             name_lbl.setStyleSheet('font-weight:600')
+            ip_lbl = QLabel(ip)
+            ip_lbl.setObjectName('statusIp')
+            ip_font = QFont()
+            ip_font.setPointSize(9)
+            ip_lbl.setFont(ip_font)
             h.addWidget(dot)
             h.addWidget(name_lbl)
+            h.addWidget(ip_lbl)
             h.addStretch()
             v.addLayout(h)
             info = QLabel('...')
@@ -110,9 +121,9 @@ class UAVControlApp(QMainWindow):
             self._status_cards[drone_id] = {"dot": dot, "info": info}
             return f
 
-        status_layout.addWidget(make_status_card(1, 'UAV1'))
-        status_layout.addWidget(make_status_card(2, 'UAV2'))
-        status_layout.addWidget(make_status_card(3, 'UAV3'))
+        for drone_id in (1, 2, 3):
+            drone = self.mission.DRONES[drone_id]
+            status_layout.addWidget(make_status_card(drone_id, drone.display_name, drone.ssh_target))
         left_panel.addWidget(status_frame)
 
         # 操作说明
@@ -135,6 +146,10 @@ class UAVControlApp(QMainWindow):
         self.log_view.setReadOnly(True)
         self.log_view.setObjectName('logView')
         self.log_view.setPlaceholderText("任务日志会显示在这里")
+        # Flush any log lines buffered before log_view existed
+        for line in self._early_logs:
+            self.log_view.append(line)
+        self._early_logs.clear()
         left_panel.addWidget(self.log_view)
 
         main_layout.addLayout(left_panel, 2)
@@ -149,10 +164,13 @@ class UAVControlApp(QMainWindow):
         aux_frame.setObjectName('auxFrame')
         aux_layout = QHBoxLayout(aux_frame)
         aux_layout.setSpacing(8)
+        self.auto_ssh_button = QPushButton("SSH连接")
+        self.auto_ssh_button.setProperty('role','core')
         self.check_ssh_button = QPushButton("检查SSH状态")
         self.check_ssh_button.setProperty('role','core')
         self.takeoff_seq_button = QPushButton("顺序阶段起飞日志")
         self.takeoff_seq_button.setProperty('role','core')
+        aux_layout.addWidget(self.auto_ssh_button)
         aux_layout.addWidget(self.check_ssh_button)
         aux_layout.addWidget(self.takeoff_seq_button)
         right_layout.addWidget(aux_frame)
@@ -219,6 +237,7 @@ class UAVControlApp(QMainWindow):
         self.setCentralWidget(central_widget)
 
         # 重新连接信号（与原逻辑完全保持一致）
+        self.auto_ssh_button.clicked.connect(self.auto_ssh_connect)
         self.check_ssh_button.clicked.connect(self.check_ssh)
         self.start_basic_button.clicked.connect(self.start_basic_chain)
         self.start_control_button.clicked.connect(self.start_control_stage)
@@ -251,10 +270,6 @@ class UAVControlApp(QMainWindow):
         self.land_uav3_button.clicked.connect(lambda: self.request_landing([3]))
         self.land_all_button.clicked.connect(lambda: self.request_landing([1, 2, 3]))
 
-        # 后端对象保持不变
-        self.mission = MissionOrchestrator()
-        self.ros_adapter = RosAdapter(self.append_log)
-
         self._task_worker = None
         self._task_in_progress = False
 
@@ -273,6 +288,8 @@ QLabel { color: #2D3436 }
 
 /* Status indicator default */
 QLabel#statusDot { border-radius: 7px; background: #E0E0E0; }
+/* IP label in status card header */
+QLabel#statusIp { color: #999999; }
 
 /* Core action buttons (highlight) */
 QPushButton[role="core"] { background: #3498DB; color: #FFFFFF; min-height: 42px; min-width: 140px; border-radius: 8px; }
@@ -298,9 +315,17 @@ QFrame > QPushButton { background: transparent }
         self.append_log("提示：当前采用手动 SSH 前置连接模式，按钮会通过 ssh alias 执行固定命令。")
 
     def append_log(self, message):
-        """Append one timestamped log line."""
+        """Append one timestamped log line.
+
+        Safe to call before log_view is created — early messages are
+        buffered and flushed once the widget is ready.
+        """
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        self.log_view.append(f"[{timestamp}] {message}")
+        line = f"[{timestamp}] {message}"
+        if hasattr(self, "log_view") and self.log_view is not None:
+            self.log_view.append(line)
+        else:
+            self._early_logs.append(line)
 
     def _set_status_card(self, drone_id: int, connected: bool, info_text: str):
         card = self._status_cards.get(drone_id)
@@ -341,6 +366,7 @@ QFrame > QPushButton { background: transparent }
         self.land_all_button.setEnabled(enabled)
 
     def _set_mission_buttons_enabled(self, enabled: bool):
+        self.auto_ssh_button.setEnabled(enabled)
         self.check_ssh_button.setEnabled(enabled)
         self.start_basic_button.setEnabled(enabled)
         self.start_control_button.setEnabled(enabled)
@@ -358,7 +384,7 @@ QFrame > QPushButton { background: transparent }
     def _on_task_finished(self, task_name: str, ok: bool):
         self._task_in_progress = False
         self._set_mission_buttons_enabled(True)
-        if task_name == "check_ssh" and self._latest_ssh_snapshot is not None:
+        if task_name in ("check_ssh", "auto_ssh") and self._latest_ssh_snapshot is not None:
             self._apply_ssh_snapshot(self._latest_ssh_snapshot)
         self.append_log(f"[TASK] finished: {task_name}, success={ok}")
 
@@ -378,6 +404,14 @@ QFrame > QPushButton { background: transparent }
 
         self._task_worker = worker
         worker.start()
+
+    def auto_ssh_connect(self):
+        def task(log):
+            ok = self.mission.auto_ssh_connect(log)
+            self._latest_ssh_snapshot = self.mission.collect_ssh_status_snapshot()
+            return ok
+
+        self._run_background_task("auto_ssh", task)
 
     def check_ssh(self):
         def task(log):

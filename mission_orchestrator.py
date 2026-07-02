@@ -53,16 +53,17 @@ class MissionOrchestrator:
 
     # PX4 command for nuc2 (passwordless sudo).
     _PX4_CMD_NUC2 = (
-        "sudo chmod 777 /dev/ttyACM0 && "
-        "source /opt/ros/noetic/setup.bash && "
-        "roslaunch mavros px4.launch"
+        "echo 8888 | sudo -S bash -c "
+        "'source /opt/ros/noetic/setup.bash && "
+        "if [ -e /dev/ttyACM0 ]; then chmod 777 /dev/ttyACM0; fi && "
+        "roslaunch mavros px4.launch'"
     )
 
     DRONES: Dict[int, DroneConfig] = {
         1: DroneConfig(
             display_name="nuc",
-            # ssh_target="nuc@192.168.0.121",
-            ssh_target="nvidia@192.168.18.100",
+            ssh_target="nuc@192.168.0.121",
+           # ssh_target="nvidia@192.168.18.100",
             session_name="nuc_drone",
             windows=(
                 WindowDef("1_px4", main_cmd=_PX4_CMD_NUC_FLY, execute=True),
@@ -78,8 +79,8 @@ class MissionOrchestrator:
         ),
         2: DroneConfig(
             display_name="fly",
-            #ssh_target="fly@192.168.0.195",
-            ssh_target="nvidia@192.168.18.100",
+            ssh_target="fly@192.168.0.195",
+           # ssh_target="nvidia@192.168.18.100",
             session_name="fly_drone",
             windows=(
                 WindowDef("1_px4", main_cmd=_PX4_CMD_NUC_FLY, execute=True),
@@ -95,8 +96,8 @@ class MissionOrchestrator:
         ),
         3: DroneConfig(
             display_name="nuc2",
-            #ssh_target="nuc2@192.168.0.X",
-            ssh_target="nvidia@192.168.18.100",
+            ssh_target="nuc2@192.168.0.243",
+            #ssh_target="nvidia@192.168.18.100",
             session_name="nuc2_drone",
             windows=(
                 WindowDef("1_px4", main_cmd=_PX4_CMD_NUC2, execute=True),
@@ -346,6 +347,58 @@ class MissionOrchestrator:
                 log(f"[SSH] {drone.display_name} tmux 会话暂未就绪，属于正常现象（如果还没启动基础链路）")
 
         return all_ok
+
+    def auto_ssh_connect(self, log: LogFn) -> bool:
+        """Lightweight auto-connect probe to all drones.
+
+        Uses ``StrictHostKeyChecking=accept-new`` so first-time connections
+        are accepted without manual intervention.  Only a trivial ``echo ok``
+        is executed — this is enough to warm SSH host-key cache and confirm
+        reachability without the overhead of ``_probe_summary``.
+
+        This method runs its own ``ssh`` subprocess (not through
+        ``_run_remote_command``) so it can inject ``StrictHostKeyChecking``
+        without affecting the standard command path.
+        """
+        all_ok = True
+        log("[AUTO-SSH] 开始自动连接各无人机 …")
+        for drone in self.DRONES.values():
+            args = [
+                "ssh",
+                "-o", "BatchMode=yes",
+                "-o", "StrictHostKeyChecking=accept-new",
+                "-o", f"ConnectTimeout={self.SSH_CONNECT_TIMEOUT_SEC}",
+                drone.ssh_target,
+                "echo ok",
+            ]
+            try:
+                completed = subprocess.run(
+                    args,
+                    capture_output=True,
+                    text=True,
+                    timeout=self.SSH_CONNECT_TIMEOUT_SEC + 2,
+                    check=False,
+                )
+                code = completed.returncode
+                stderr = (completed.stderr or "").strip()
+            except FileNotFoundError as exc:
+                log(f"[AUTO-SSH] {drone.display_name} ssh 命令未找到: {exc}")
+                all_ok = False
+                continue
+            except subprocess.TimeoutExpired as exc:
+                log(f"[AUTO-SSH] {drone.display_name} 连接超时")
+                all_ok = False
+                continue
+
+            if code != 0:
+                all_ok = False
+                detail = stderr[:200] if stderr else f"exit_code={code}"
+                log(f"[AUTO-SSH] {drone.display_name} 连接失败: {detail}")
+            else:
+                log(f"[AUTO-SSH] {drone.display_name} 连接成功")
+        log(f"[AUTO-SSH] 自动连接完成 all_ok={all_ok}")
+        return all_ok
+
     def start_basic_chain(self, log: LogFn) -> bool:
         """Create tmux sessions on each drone and start windows 1-7 sequentially.
 
