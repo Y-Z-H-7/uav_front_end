@@ -63,7 +63,7 @@ class MissionOrchestrator:
         1: DroneConfig(
             display_name="nuc",
             ssh_target="nuc@192.168.0.121",
-           # ssh_target="nvidia@192.168.18.100",
+            #ssh_target="nvidia@192.168.18.100",
             session_name="nuc_drone",
             windows=(
                 WindowDef("1_px4", main_cmd=_PX4_CMD_NUC_FLY, execute=True),
@@ -74,13 +74,13 @@ class MissionOrchestrator:
                 WindowDef("6_trans", setups=("source ~/racer/devel/setup.bash",), main_cmd="rosrun cxr_egoctrl_v1 trans.py", execute=True),
                 WindowDef("7_bridge", setups=("source ~/swarm_ros_bridge_ws/devel/setup.bash",), main_cmd="roslaunch swarm_ros_bridge bridge_drone1.launch", execute=True),
                 WindowDef("8_cxr_egoctrl", setups=("source ~/racer/devel/setup.bash",), main_cmd="rosrun cxr_egoctrl_v1 cxr_egoctrl_v2", execute=False),
-                WindowDef("9_exploration", setups=("source ~/racer/devel/setup.bash",), main_cmd="roslaunch exploration_manager swarm_exploration_realworld.launch 2>&1 | tee '/home/nuc/文档/swarm$(date +%Y%m%d%H%M%S).log'", execute=False),
+                WindowDef("9_exploration", setups=("source ~/racer/devel/setup.bash",), main_cmd="roslaunch exploration_manager swarm_exploration_realworld.launch 2>&1 | tee \"/home/nuc/文档/swarm$(date +%Y%m%d%H%M%S).log\"", execute=False),
             ),
         ),
         2: DroneConfig(
             display_name="fly",
             ssh_target="fly@192.168.0.195",
-           # ssh_target="nvidia@192.168.18.100",
+            #ssh_target="nvidia@192.168.18.100",
             session_name="fly_drone",
             windows=(
                 WindowDef("1_px4", main_cmd=_PX4_CMD_NUC_FLY, execute=True),
@@ -91,7 +91,7 @@ class MissionOrchestrator:
                 WindowDef("6_trans", setups=("source ~/racer/devel/setup.bash",), main_cmd="rosrun cxr_egoctrl_v1 trans.py", execute=True),
                 WindowDef("7_bridge", setups=("source ~/swarm_ros_bridge_ws/devel/setup.bash",), main_cmd="roslaunch swarm_ros_bridge bridge_drone2.launch", execute=True),
                 WindowDef("8_cxr_egoctrl", setups=("source ~/racer/devel/setup.bash",), main_cmd="rosrun cxr_egoctrl_v1 cxr_egoctrl_v2", execute=False),
-                WindowDef("9_exploration", setups=("source ~/racer/devel/setup.bash",), main_cmd="roslaunch exploration_manager swarm_exploration_realworld.launch 2>&1 | tee '/home/fly/Music/swarm$(date +%Y%m%d%H%M%S).log'", execute=False),
+                WindowDef("9_exploration", setups=("source ~/racer/devel/setup.bash",), main_cmd="roslaunch exploration_manager swarm_exploration_realworld.launch 2>&1 | tee \"/home/fly/Music/swarm$(date +%Y%m%d%H%M%S).log\"", execute=False),
             ),
         ),
         3: DroneConfig(
@@ -108,7 +108,7 @@ class MissionOrchestrator:
                 WindowDef("6_trans", setups=("chmod +x /home/nuc2/racer/src/control/src/trans.py", "source ~/racer/devel/setup.bash"), main_cmd="rosrun cxr_egoctrl_v1 trans.py", execute=True),
                 WindowDef("7_bridge", setups=("source ~/swarm_ros_bridge_ws/devel/setup.bash",), main_cmd="roslaunch swarm_ros_bridge bridge_drone3.launch", execute=True),
                 WindowDef("8_cxr_egoctrl", setups=("source ~/racer/devel/setup.bash",), main_cmd="rosrun cxr_egoctrl_v1 cxr_egoctrl_v2", execute=False),
-                WindowDef("9_exploration", setups=("source ~/racer/devel/setup.bash",), main_cmd="roslaunch exploration_manager swarm_exploration_realworld.launch 2>&1 | tee '/home/nuc2/文档/swarm$(date +%Y%m%d%H%M%S).log'", execute=False),
+                WindowDef("9_exploration", setups=("source ~/racer/devel/setup.bash",), main_cmd="roslaunch exploration_manager swarm_exploration_realworld.launch 2>&1 | tee \"/home/nuc2/文档/swarm$(date +%Y%m%d%H%M%S).log\"", execute=False),
             ),
         ),
     }
@@ -120,7 +120,7 @@ class MissionOrchestrator:
 
     def __init__(
         self,
-        manual_stage_start_order: Tuple[int, int, int] = (2, 1, 3),
+        manual_stage_start_order: Tuple[int, int, int] = (3, 2, 1),
         manual_stage_start_delay_sec: float = 1.0,
     ) -> None:
         # Only affects the manual stage buttons (control/exploration).
@@ -584,7 +584,7 @@ class MissionOrchestrator:
                 if code != 0:
                     all_ok = False
 
-            if index == 0 and len(ordered_drone_ids) > 1 and self.manual_stage_start_delay_sec > 0:
+            if index < len(ordered_drone_ids) - 1 and self.manual_stage_start_delay_sec > 0:
                 time.sleep(self.manual_stage_start_delay_sec)
 
         log(f"[TASK] trigger_manual_stage({stage}) 结束 success={all_ok}")

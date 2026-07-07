@@ -132,9 +132,9 @@ class UAVControlApp(QMainWindow):
         hint_box.setObjectName('hintBox')
         hint_box.setHtml(
             "<b>Operational Guidelines</b><br>"
-            "当前为手动 SSH 协作模式：先在 VSCode 或终端里分别连上 uav1 / uav2 / uav3，"
-            "再使用本前端的按钮执行固定远程命令。<br>"
-            "检查SSH：输出各机基础状况（whoami/hostname/tmux 状态）。<br>"
+            "当前为自动 SSH 协作模式"
+            "使用本前端的按钮执行固定远程命令。<br>"
+            "连接/检查SSH：输出各机基础状况（whoami/hostname/tmux 状态）。<br>"
             "启动基础链路：通过 SSH 在远端创建 tmux 会话并依次启动窗口1-7。<br>"
             "降落控制：分别控制各机降落，或同时发起全部降落。<br>"
             f"（降落请求会连发 {LANDING_REPEAT_COUNT} 次，间隔 {int(LANDING_REPEAT_INTERVAL*1000)}ms）"
@@ -312,7 +312,7 @@ QFrame > QPushButton { background: transparent }
 
         self._apply_ssh_snapshot({})
         self.append_log("界面已启动，等待任务指令。（支持 3 架无人机）")
-        self.append_log("提示：当前采用手动 SSH 前置连接模式，按钮会通过 ssh alias 执行固定命令。")
+        self.append_log("提示：当前采用自动 SSH 连接模式，连接成功后按钮会通过 ssh alias 执行固定命令。")
 
     def append_log(self, message):
         """Append one timestamped log line.
