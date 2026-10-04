@@ -55,6 +55,9 @@ class TaskWorker(QThread):
 class UAVControlApp(QMainWindow):
     """Dual-UAV control main window."""
 
+    ros_log_signal = Signal(str)
+    battery_signal = Signal(int, float, float)  # uav_id, percentage, voltage
+
     def __init__(self):
         super().__init__()
         self.setWindowTitle("多机任务控制前端")
@@ -69,14 +72,19 @@ class UAVControlApp(QMainWindow):
 
         # 后端对象（状态卡片创建时需要引用 drone 配置）
         self.mission = MissionOrchestrator()
-        self.ros_adapter = RosAdapter(self.append_log)
+        self.ros_log_signal.connect(self.append_log)
+        self.battery_signal.connect(self._on_battery)
+        self.ros_adapter = RosAdapter(
+            self.ros_log_signal.emit,
+            battery_callback=self.battery_signal.emit,
+        )
 
         # 左侧面板：状态卡 + 操作说明 + 日志
         left_panel = QVBoxLayout()
 
         title_label = QLabel("多机任务控制前端")
         title_font = QFont()
-        title_font.setPointSize(18)
+        title_font.setPointSize(27)
         title_font.setBold(True)
         title_label.setFont(title_font)
         title_label.setAlignment(Qt.AlignCenter)
@@ -114,11 +122,17 @@ class UAVControlApp(QMainWindow):
             h.addWidget(ip_lbl)
             h.addStretch()
             v.addLayout(h)
+            battery = QLabel('电量: --')
+            battery.setObjectName('statusBattery')
+            battery_font = QFont()
+            battery_font.setPointSize(10)
+            battery.setFont(battery_font)
+            v.addWidget(battery)
             info = QLabel('...')
             info.setObjectName('statusInfo')
             info.setWordWrap(True)
             info.setMaximumHeight(40)
-            self._status_cards[drone_id] = {"dot": dot, "info": info}
+            self._status_cards[drone_id] = {"dot": dot, "info": info, "battery": battery}
             return f
 
         for drone_id in (1, 2, 3):
@@ -300,7 +314,7 @@ QPushButton[role="core"]:pressed { background: #246ea8 }
 QPushButton[role="end"] { background: #E0E6ED; color: #4A4A4A; min-height: 42px; min-width: 140px; border-radius: 8px; }
 
 /* Fallback button style */
-QPushButton { background: #E0E6ED; color: #4A4A4A }
+QPushButton { background: #E0E6ED; color: #4A4A4A; font-size: 16px; }
 
 /* minor accents */
 QFrame > QPushButton { background: transparent }
@@ -313,6 +327,16 @@ QFrame > QPushButton { background: transparent }
         self._apply_ssh_snapshot({})
         self.append_log("界面已启动，等待任务指令。（支持 3 架无人机）")
         self.append_log("提示：当前采用自动 SSH 连接模式，连接成功后按钮会通过 ssh alias 执行固定命令。")
+
+    def _on_battery(self, uav_id: int, pct: float, volt: float):
+        card = self._status_cards.get(uav_id)
+        if not card or "battery" not in card:
+            return
+        if pct < 0:
+            text = f"电量: N/A  ({volt:.2f}V)"
+        else:
+            text = f"电量: {pct*100:.0f}%  ({volt:.2f}V)"
+        card["battery"].setText(text)
 
     def append_log(self, message):
         """Append one timestamped log line.

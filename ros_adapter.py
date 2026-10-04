@@ -15,6 +15,11 @@ ROS 适配层：统一负责"发布控制请求、订阅状态（后续可扩展
 """
 
 import time
+
+from sensor_msgs.msg import BatteryState
+
+from geometry_msgs.msg import PoseStamped
+
 from typing import Callable, Dict, Iterable, Optional
 
 from PySide6.QtCore import QThread, Signal
@@ -85,8 +90,12 @@ class RosAdapter:
         self,
         log_callback: Optional[Callable[[str], None]] = None,
         landing_topics: Optional[Dict[int, str]] = None,
+        battery_callback: Optional[Callable[[int, float, float], None]] = None,
+        pose_callback: Optional[Callable[[int, float, float, float], None]] = None,
     ):
         self.log_callback = log_callback or (lambda message: None)
+        self.battery_callback = battery_callback or (lambda uav_id, pct, volt: None)
+        self.pose_callback = pose_callback or (lambda uav_id, x, y, z: None)
 
         # 这些 topic 可由 swarm_ros_bridge 转发到目标无人机。
         self.landing_topics = landing_topics or {
@@ -100,6 +109,8 @@ class RosAdapter:
 
         # 保存活动的发送线程，避免被GC回收
         self._active_threads = []
+        # 保存 Subscriber，防止被 GC 回收
+        self._subs = []
 
         if not ROS_AVAILABLE:
             self._log("ROS 环境不可用，当前以占位模式运行。")
@@ -119,12 +130,60 @@ class RosAdapter:
 
             self.ros_ready = True
             self._log("ROS 适配层已初始化（Bool 触发模式，连发提高可靠性）。")
+            
+            for uav_id in sorted(self.landing_topics.keys()):
+                ns = f"uav{uav_id}"
+                self._subs.append(rospy.Subscriber(
+                    f"/{ns}/mavros/battery",
+                    BatteryState,
+                    self._make_battery_cb(uav_id, ns),
+                    queue_size=1,
+                ))
+            
+            for uav_id in sorted(self.landing_topics.keys()):
+                ns = f"uav{uav_id}"
+                self._subs.append(rospy.Subscriber(
+                    f"/{ns}/mavros/local_position/pose",
+                    PoseStamped,
+                    self._make_pose_cb(uav_id),
+                    queue_size=1,
+                ))
+
+            self._log("已订阅 /uavX/mavros/battery。")
+            self._log("已订阅 /uavX/mavros/local_position/pose。")
+
         except Exception as exc:
             self.ros_ready = False
             self._log(f"ROS 适配层初始化失败：{exc}")
 
     def _log(self, message: str) -> None:
         self.log_callback(message)
+    
+    def _make_battery_cb(self, uav_id, ns):
+        import time
+        last = [0.0]
+        def cb(msg):
+            now = time.time()
+            if now - last[0] < 1.0:   # 1Hz 节流
+                return
+            last[0] = now
+            pct = msg.percentage
+            if pct != pct:
+                pct = -1.0
+            self.battery_callback(uav_id, pct, msg.voltage)
+        return cb
+    
+    def _make_pose_cb(self, uav_id):
+        import time
+        last = [0.0]
+        def cb(msg):
+            now = time.time()
+            if now - last[0] < 0.2:   # 5Hz
+                return
+            last[0] = now
+            p = msg.pose.position
+            self.pose_callback(uav_id, p.x, p.y, p.z)
+        return cb
 
     def _on_thread_finished(self, thread: LandingPublisher) -> None:
         """线程结束后从活动列表移除，让Python GC回收。"""
