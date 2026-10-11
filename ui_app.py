@@ -57,6 +57,7 @@ class UAVControlApp(QMainWindow):
 
     ros_log_signal = Signal(str)
     battery_signal = Signal(int, float, float)  # uav_id, percentage, voltage
+    pose_signal = Signal(int, float, float, float)  # uav_id, x, y, z
 
     def __init__(self):
         super().__init__()
@@ -67,6 +68,10 @@ class UAVControlApp(QMainWindow):
         main_layout = QHBoxLayout(central_widget)
 
         self._status_cards: Dict[int, Dict[str, QLabel]] = {}
+        self._select_buttons: Dict[int, QPushButton] = {}
+        self._selected_drones: set = set()
+        self._end_buttons: Dict[int, QPushButton] = {}
+        self._land_buttons: Dict[int, QPushButton] = {}
         self._latest_ssh_snapshot: Optional[Dict[int, Dict[str, str]]] = None
         self._early_logs: list = []  # buffered before log_view exists
 
@@ -74,9 +79,11 @@ class UAVControlApp(QMainWindow):
         self.mission = MissionOrchestrator()
         self.ros_log_signal.connect(self.append_log)
         self.battery_signal.connect(self._on_battery)
+        self.pose_signal.connect(self._on_pose)
         self.ros_adapter = RosAdapter(
             self.ros_log_signal.emit,
             battery_callback=self.battery_signal.emit,
+            pose_callback=self.pose_signal.emit,
         )
 
         # 左侧面板：状态卡 + 操作说明 + 日志
@@ -102,7 +109,7 @@ class UAVControlApp(QMainWindow):
             # Prevent card from growing beyond its fair share of horizontal space
             f.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
             f.setMinimumWidth(220)
-            f.setMaximumHeight(80)
+            f.setMaximumHeight(120)
             v = QVBoxLayout(f)
             v.setContentsMargins(6, 4, 6, 4)
             v.setSpacing(2)
@@ -128,14 +135,34 @@ class UAVControlApp(QMainWindow):
             battery_font.setPointSize(10)
             battery.setFont(battery_font)
             v.addWidget(battery)
+            position = QLabel('位置: --')
+            position.setObjectName('statusPosition')
+            position_font = QFont()
+            position_font.setPointSize(9)
+            position.setFont(position_font)
+            v.addWidget(position)
             info = QLabel('...')
             info.setObjectName('statusInfo')
             info.setWordWrap(True)
             info.setMaximumHeight(40)
-            self._status_cards[drone_id] = {"dot": dot, "info": info, "battery": battery}
+            self._status_cards[drone_id] = {"dot": dot, "info": info, "battery": battery, "position": position}
+
+            # 选择按钮：绿色=选中（参与起飞），红色=未选中
+            select_btn = QPushButton("✓ 已选")
+            select_btn.setObjectName('selectBtn')
+            select_btn.setCheckable(True)
+            select_btn.setChecked(True)
+            self._selected_drones.add(drone_id)
+            select_btn.clicked.connect(
+                lambda *args, did=drone_id: self._toggle_drone_selection(did)
+            )
+            self._select_buttons[drone_id] = select_btn
+            self._update_select_button_style(drone_id)
+            v.addWidget(select_btn)
+
             return f
 
-        for drone_id in (1, 2, 3):
+        for drone_id in sorted(self.mission.DRONES.keys()):
             drone = self.mission.DRONES[drone_id]
             status_layout.addWidget(make_status_card(drone_id, drone.display_name, drone.ssh_target))
         left_panel.addWidget(status_frame)
@@ -146,8 +173,8 @@ class UAVControlApp(QMainWindow):
         hint_box.setObjectName('hintBox')
         hint_box.setHtml(
             "<b>Operational Guidelines</b><br>"
-            "当前为自动 SSH 协作模式"
-            "使用本前端的按钮执行固定远程命令。<br>"
+            "当前为自动 SSH 协作模式，使用本前端的按钮执行固定远程命令。<br>"
+            "<b>飞机选择</b>：每张卡片下方的按钮，绿色=选中（参与起飞），红色=未选中（跳过）。<br>"
             "连接/检查SSH：输出各机基础状况（whoami/hostname/tmux 状态）。<br>"
             "启动基础链路：通过 SSH 在远端创建 tmux 会话并依次启动窗口1-7。<br>"
             "降落控制：分别控制各机降落，或同时发起全部降落。<br>"
@@ -223,27 +250,22 @@ class UAVControlApp(QMainWindow):
         end_frame.setObjectName('endFrame')
         end_layout = QGridLayout(end_frame)
         end_layout.setSpacing(8)
-        self.end_uav1_button = QPushButton("结束1号机任务")
-        self.end_uav1_button.setProperty('role','end')
-        self.end_uav2_button = QPushButton("结束2号机任务")
-        self.end_uav2_button.setProperty('role','end')
-        self.end_uav3_button = QPushButton("结束3号机任务")
-        self.end_uav3_button.setProperty('role','end')
-        self.land_uav1_button = QPushButton("1号机降落")
-        self.land_uav1_button.setProperty('role','end')
-        self.land_uav2_button = QPushButton("2号机降落")
-        self.land_uav2_button.setProperty('role','end')
-        self.land_uav3_button = QPushButton("3号机降落")
-        self.land_uav3_button.setProperty('role','end')
+        # 动态生成结束/降落按钮（根据 DRONES 配置自动适配数量）
+        drone_ids_sorted = sorted(self.mission.DRONES.keys())
+        drone_count = len(drone_ids_sorted)
+        for col, drone_id in enumerate(drone_ids_sorted):
+            drone = self.mission.DRONES[drone_id]
+            end_btn = QPushButton(f"结束{drone_id}号机({drone.display_name})")
+            end_btn.setProperty('role', 'end')
+            land_btn = QPushButton(f"{drone_id}号机降落({drone.display_name})")
+            land_btn.setProperty('role', 'end')
+            self._end_buttons[drone_id] = end_btn
+            self._land_buttons[drone_id] = land_btn
+            end_layout.addWidget(end_btn, 0, col)
+            end_layout.addWidget(land_btn, 1, col)
         self.land_all_button = QPushButton("同时降落全部")
-        self.land_all_button.setProperty('role','end')
-        end_layout.addWidget(self.end_uav1_button, 0, 0)
-        end_layout.addWidget(self.end_uav2_button, 0, 1)
-        end_layout.addWidget(self.end_uav3_button, 0, 2)
-        end_layout.addWidget(self.land_uav1_button, 1, 0)
-        end_layout.addWidget(self.land_uav2_button, 1, 1)
-        end_layout.addWidget(self.land_uav3_button, 1, 2)
-        end_layout.addWidget(self.land_all_button, 2, 0, 1, 3)
+        self.land_all_button.setProperty('role', 'end')
+        end_layout.addWidget(self.land_all_button, 2, 0, 1, drone_count)
         right_layout.addWidget(end_frame)
 
         main_layout.addWidget(right_frame, 1)
@@ -257,32 +279,24 @@ class UAVControlApp(QMainWindow):
         self.start_control_button.clicked.connect(self.start_control_stage)
         self.start_exploration_button.clicked.connect(self.start_exploration_stage)
         self.takeoff_seq_button.clicked.connect(self.run_takeoff_sequence)
-        self.end_uav1_button.clicked.connect(
-            lambda: self._run_background_task(
-                "end_uav1_task",
-                lambda log: self.mission.terminate_tmux_session(1, log),
+        # 动态连接结束/降落按钮信号
+        for drone_id in sorted(self.mission.DRONES.keys()):
+            self._end_buttons[drone_id].clicked.connect(
+                lambda checked=False, did=drone_id: self._run_background_task(
+                    f"end_uav{did}_task",
+                    lambda log, did=did: self.mission.terminate_tmux_session(did, log),
+                )
             )
-        )
-        self.end_uav2_button.clicked.connect(
-            lambda: self._run_background_task(
-                "end_uav2_task",
-                lambda log: self.mission.terminate_tmux_session(2, log),
+            self._land_buttons[drone_id].clicked.connect(
+                lambda checked=False, did=drone_id: self.request_landing([did])
             )
-        )
-        self.end_uav3_button.clicked.connect(
-            lambda: self._run_background_task(
-                "end_uav3_task",
-                lambda log: self.mission.terminate_tmux_session(3, log),
-            )
-        )
         self.launch_bridge_button.clicked.connect(lambda: self._run_background_task(
             "launch_bridge", lambda log: self.mission.launch_bridge_node_gcs(log)))
         self.launch_exploration_rviz_button.clicked.connect(lambda: self._run_background_task(
             "launch_exploration_rviz", lambda log: self.mission.launch_exploration_rviz(log)))
-        self.land_uav1_button.clicked.connect(lambda: self.request_landing([1]))
-        self.land_uav2_button.clicked.connect(lambda: self.request_landing([2]))
-        self.land_uav3_button.clicked.connect(lambda: self.request_landing([3]))
-        self.land_all_button.clicked.connect(lambda: self.request_landing([1, 2, 3]))
+        self.land_all_button.clicked.connect(
+            lambda: self.request_landing(self._get_selected_drone_ids())
+        )
 
         self._task_worker = None
         self._task_in_progress = False
@@ -325,8 +339,42 @@ QFrame > QPushButton { background: transparent }
             app.setStyleSheet(dark_style)
 
         self._apply_ssh_snapshot({})
-        self.append_log("界面已启动，等待任务指令。（支持 3 架无人机）")
+        drone_names = ', '.join(d.display_name for d in self.mission.DRONES.values())
+        self.append_log(f"界面已启动，等待任务指令。（支持 {len(self.mission.DRONES)} 架无人机：{drone_names}）")
         self.append_log("提示：当前采用自动 SSH 连接模式，连接成功后按钮会通过 ssh alias 执行固定命令。")
+
+    def _toggle_drone_selection(self, drone_id: int):
+        if drone_id in self._selected_drones:
+            self._selected_drones.discard(drone_id)
+            checked = False
+        else:
+            self._selected_drones.add(drone_id)
+            checked = True
+        self._update_select_button_style(drone_id)
+        drone = self.mission.DRONES.get(drone_id)
+        name = drone.display_name if drone else drone_id
+        state = "已选" if checked else "未选"
+        self.append_log(f"[SELECT] {name}({drone_id}号) {state}，当前选中: {sorted(self._selected_drones)}")
+
+    def _update_select_button_style(self, drone_id: int):
+        btn = self._select_buttons.get(drone_id)
+        if not btn:
+            return
+        if drone_id in self._selected_drones:
+            btn.setText("✓ 已选")
+            btn.setStyleSheet(
+                "QPushButton { background: #2ECC71; color: #FFFFFF; "
+                "min-height: 30px; border-radius: 6px; font-weight: bold; }"
+            )
+        else:
+            btn.setText("✗ 未选")
+            btn.setStyleSheet(
+                "QPushButton { background: #E74C3C; color: #FFFFFF; "
+                "min-height: 30px; border-radius: 6px; font-weight: bold; }"
+            )
+
+    def _get_selected_drone_ids(self) -> list:
+        return sorted(self._selected_drones)
 
     def _on_battery(self, uav_id: int, pct: float, volt: float):
         card = self._status_cards.get(uav_id)
@@ -337,6 +385,12 @@ QFrame > QPushButton { background: transparent }
         else:
             text = f"电量: {pct*100:.0f}%  ({volt:.2f}V)"
         card["battery"].setText(text)
+
+    def _on_pose(self, uav_id: int, x: float, y: float, z: float):
+        card = self._status_cards.get(uav_id)
+        if not card or "position" not in card:
+            return
+        card["position"].setText(f"位置: ({x:.1f}, {y:.1f}, {z:.1f})")
 
     def append_log(self, message):
         """Append one timestamped log line.
@@ -384,9 +438,8 @@ QFrame > QPushButton { background: transparent }
             self._set_status_card(drone_id, connected, info_text)
 
     def _set_landing_buttons_enabled(self, enabled: bool):
-        self.land_uav1_button.setEnabled(enabled)
-        self.land_uav2_button.setEnabled(enabled)
-        self.land_uav3_button.setEnabled(enabled)
+        for btn in self._land_buttons.values():
+            btn.setEnabled(enabled)
         self.land_all_button.setEnabled(enabled)
 
     def _set_mission_buttons_enabled(self, enabled: bool):
@@ -396,9 +449,8 @@ QFrame > QPushButton { background: transparent }
         self.start_control_button.setEnabled(enabled)
         self.start_exploration_button.setEnabled(enabled)
         self.takeoff_seq_button.setEnabled(enabled)
-        self.end_uav1_button.setEnabled(enabled)
-        self.end_uav2_button.setEnabled(enabled)
-        self.end_uav3_button.setEnabled(enabled)
+        for btn in self._end_buttons.values():
+            btn.setEnabled(enabled)
         self.launch_bridge_button.setEnabled(enabled)
         self.launch_exploration_rviz_button.setEnabled(enabled)
 
@@ -430,34 +482,60 @@ QFrame > QPushButton { background: transparent }
         worker.start()
 
     def auto_ssh_connect(self):
+        selected = self._get_selected_drone_ids()
+        if not selected:
+            self.append_log("[TASK] 未选中任何飞机，已忽略")
+            return
+        self.append_log(f"[TASK] 目标飞机: {selected}")
         def task(log):
-            ok = self.mission.auto_ssh_connect(log)
+            ok = self.mission.auto_ssh_connect(log, drone_ids=selected)
             self._latest_ssh_snapshot = self.mission.collect_ssh_status_snapshot()
             return ok
-
         self._run_background_task("auto_ssh", task)
 
     def check_ssh(self):
+        selected = self._get_selected_drone_ids()
+        if not selected:
+            self.append_log("[TASK] 未选中任何飞机，已忽略")
+            return
+        self.append_log(f"[TASK] 目标飞机: {selected}")
         def task(log):
-            ok = self.mission.check_ssh_connectivity(log)
+            ok = self.mission.check_ssh_connectivity(log, drone_ids=selected)
             self._latest_ssh_snapshot = self.mission.collect_ssh_status_snapshot()
             return ok
-
         self._run_background_task("check_ssh", task)
 
     def start_basic_chain(self):
-        self._run_background_task("start_basic_chain", self.mission.start_basic_chain)
+        selected = self._get_selected_drone_ids()
+        if not selected:
+            self.append_log("[TASK] 未选中任何飞机，已忽略")
+            return
+        self.append_log(f"[TASK] 目标飞机: {selected}")
+        self._run_background_task(
+            "start_basic_chain",
+            lambda log: self.mission.start_basic_chain(log, drone_ids=selected),
+        )
 
     def start_control_stage(self):
+        selected = self._get_selected_drone_ids()
+        if not selected:
+            self.append_log("[TASK] 未选中任何飞机，已忽略")
+            return
+        self.append_log(f"[TASK] 目标飞机: {selected}")
         self._run_background_task(
             "start_control_stage",
-            lambda log: self.mission.trigger_manual_stage("control", log),
+            lambda log: self.mission.trigger_manual_stage("control", log, drone_ids=selected),
         )
 
     def start_exploration_stage(self):
+        selected = self._get_selected_drone_ids()
+        if not selected:
+            self.append_log("[TASK] 未选中任何飞机，已忽略")
+            return
+        self.append_log(f"[TASK] 目标飞机: {selected}")
         self._run_background_task(
             "start_exploration_stage",
-            lambda log: self.mission.trigger_manual_stage("exploration", log),
+            lambda log: self.mission.trigger_manual_stage("exploration", log, drone_ids=selected),
         )
 
     def run_takeoff_sequence(self):
@@ -466,8 +544,15 @@ QFrame > QPushButton { background: transparent }
         This ensures the operator cannot attach to sessions that have not been
         created by `start_basic_chain`.
         """
+        selected = self._get_selected_drone_ids()
+        if not selected:
+            self.append_log("[TASK] 未选中任何飞机，已忽略")
+            return
+        self.append_log(f"[TASK] 目标飞机: {selected}")
         missing = []
         for drone in self.mission.DRONES.values():
+            if drone.drone_id not in selected:
+                continue
             session_ok, _ = self.mission._check_session(drone, log=None)
             if not session_ok:
                 missing.append(drone.display_name)
@@ -478,7 +563,7 @@ QFrame > QPushButton { background: transparent }
 
         self._run_background_task(
             "open_base_chain_terminals",
-            self.mission.open_base_chain_terminals,
+            lambda log: self.mission.open_base_chain_terminals(log, drone_ids=selected),
         )
 
     def request_landing(self, uav_ids):
