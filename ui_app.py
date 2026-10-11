@@ -9,6 +9,7 @@ Current scope:
 4. Timestamped logs for field debugging.
 """
 
+import os
 import sys
 from datetime import datetime
 from typing import Dict, Optional
@@ -74,6 +75,8 @@ class UAVControlApp(QMainWindow):
         self._land_buttons: Dict[int, QPushButton] = {}
         self._latest_ssh_snapshot: Optional[Dict[int, Dict[str, str]]] = None
         self._early_logs: list = []  # buffered before log_view exists
+        self._log_file = None
+        self._init_log_file()
 
         # 后端对象（状态卡片创建时需要引用 drone 配置）
         self.mission = MissionOrchestrator()
@@ -392,18 +395,47 @@ QFrame > QPushButton { background: transparent }
             return
         card["position"].setText(f"位置: ({x:.1f}, {y:.1f}, {z:.1f})")
 
+    def _init_log_file(self):
+        """Open a daily log file for SSH remote monitoring."""
+        log_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
+        os.makedirs(log_dir, exist_ok=True)
+        log_name = f"groundstation_{datetime.now().strftime('%Y%m%d')}.log"
+        self._log_file_path = os.path.join(log_dir, log_name)
+        try:
+            self._log_file = open(self._log_file_path, "a", encoding="utf-8")
+            self._log_file.write(
+                f"\n{'=' * 60}\n"
+                f"Ground station started at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+                f"{'=' * 60}\n"
+            )
+            self._log_file.flush()
+        except Exception:
+            self._log_file = None
+
     def append_log(self, message):
         """Append one timestamped log line.
 
         Safe to call before log_view is created — early messages are
         buffered and flushed once the widget is ready.
+        Every line is also mirrored to stdout (for SSH terminal) and
+        a daily log file (for tail -f monitoring).
         """
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         line = f"[{timestamp}] {message}"
+        # 1) UI log view
         if hasattr(self, "log_view") and self.log_view is not None:
             self.log_view.append(line)
         else:
             self._early_logs.append(line)
+        # 2) stdout — visible in SSH terminal that launched run_ui.sh
+        print(line, flush=True)
+        # 3) daily log file — monitor with: tail -f logs/groundstation_YYYYMMDD.log
+        if hasattr(self, "_log_file") and self._log_file is not None:
+            try:
+                self._log_file.write(line + "\n")
+                self._log_file.flush()
+            except Exception:
+                pass
 
     def _set_status_card(self, drone_id: int, connected: bool, info_text: str):
         card = self._status_cards.get(drone_id)

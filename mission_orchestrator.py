@@ -59,6 +59,10 @@ class MissionOrchestrator:
         "roslaunch mavros px4.launch'"
     )
 
+    # ===== 无人机配置 =====
+    # 增减飞机：在此字典中添加或注释掉对应的 DroneConfig 条目即可。
+    # UI (ui_app.py) 会自动根据此字典的 keys 动态生成状态卡和按钮，无需修改 UI 代码。
+    # 示例：注释掉 1: DroneConfig(...) 即可移除 nuc；添加 4: DroneConfig(...) 即可新增第 4 架。
     DRONES: Dict[int, DroneConfig] = {
         1: DroneConfig(
             display_name="nuc",
@@ -120,7 +124,7 @@ class MissionOrchestrator:
 
     def __init__(
         self,
-        manual_stage_start_order: Tuple[int, int, int] = (3, 2, 1),
+        manual_stage_start_order: Tuple[int, ...] = (3, 2, 1),
         manual_stage_start_delay_sec: float = 1.0,
     ) -> None:
         # Only affects the manual stage buttons (control/exploration).
@@ -129,6 +133,13 @@ class MissionOrchestrator:
 
     def _format_exception(self, exc: Exception) -> str:
         return f"{type(exc).__name__}: {exc}"
+
+    def _get_active_drones(self, drone_ids: Optional[List[int]] = None) -> List[Tuple[int, DroneConfig]]:
+        """Return (drone_id, drone) pairs, optionally filtered by drone_ids."""
+        if drone_ids is None:
+            return list(self.DRONES.items())
+        id_set = set(drone_ids)
+        return [(did, d) for did, d in self.DRONES.items() if did in id_set]
 
     def _ssh_base_args(self, drone: DroneConfig) -> List[str]:
         return [
@@ -212,10 +223,10 @@ class MissionOrchestrator:
         exists = state == "0"
         return exists, f"tmux session={drone.session_name} exists={exists}"
 
-    def _cleanup_named_tmux_sessions(self, log: LogFn) -> int:
+    def _cleanup_named_tmux_sessions(self, log: LogFn, drone_ids: Optional[List[int]] = None) -> int:
         """Best-effort cleanup for known tmux session names before startup."""
         cleared = 0
-        for drone in self.DRONES.values():
+        for drone_id, drone in self._get_active_drones(drone_ids):
             remote_command = (
                 f"if tmux has-session -t {shlex.quote(drone.session_name)} >/dev/null 2>&1; then "
                 f"tmux kill-session -t {shlex.quote(drone.session_name)}; "
@@ -278,10 +289,10 @@ class MissionOrchestrator:
             log("[ATTACH] no supported terminal emulator found")
         return 127, "", "no supported terminal emulator found"
 
-    def collect_ssh_status_snapshot(self) -> Dict[int, Dict[str, str]]:
+    def collect_ssh_status_snapshot(self, drone_ids: Optional[List[int]] = None) -> Dict[int, Dict[str, str]]:
         """Collect lightweight SSH/session status for UI cards."""
         snapshot: Dict[int, Dict[str, str]] = {}
-        for drone_id, drone in self.DRONES.items():
+        for drone_id, drone in self._get_active_drones(drone_ids):
             status = {
                 "display_name": drone.display_name,
                 "ssh_target": drone.ssh_target,
@@ -319,11 +330,11 @@ class MissionOrchestrator:
 
         return snapshot
 
-    def check_ssh_connectivity(self, log: LogFn) -> bool:
+    def check_ssh_connectivity(self, log: LogFn, drone_ids: Optional[List[int]] = None) -> bool:
         all_ok = True
         log("[SSH] 基础状况检查开始")
         log("[SSH] 当前使用手动 SSH 模式：请先在 VSCode 或 ~/.ssh/config 中配置好各无人机 SSH 别名")
-        for drone in self.DRONES.values():
+        for drone_id, drone in self._get_active_drones(drone_ids):
             code, out, err = self._run_remote_command(
                 drone,
                 self._probe_summary(drone),
@@ -348,8 +359,8 @@ class MissionOrchestrator:
 
         return all_ok
 
-    def auto_ssh_connect(self, log: LogFn) -> bool:
-        """Lightweight auto-connect probe to all drones.
+    def auto_ssh_connect(self, log: LogFn, drone_ids: Optional[List[int]] = None) -> bool:
+        """Lightweight auto-connect probe to selected drones.
 
         Uses ``StrictHostKeyChecking=accept-new`` so first-time connections
         are accepted without manual intervention.  Only a trivial ``echo ok``
@@ -362,7 +373,7 @@ class MissionOrchestrator:
         """
         all_ok = True
         log("[AUTO-SSH] 开始自动连接各无人机 …")
-        for drone in self.DRONES.values():
+        for drone_id, drone in self._get_active_drones(drone_ids):
             args = [
                 "ssh",
                 "-o", "BatchMode=yes",
@@ -399,13 +410,14 @@ class MissionOrchestrator:
         log(f"[AUTO-SSH] 自动连接完成 all_ok={all_ok}")
         return all_ok
 
-    def start_basic_chain(self, log: LogFn) -> bool:
+    def start_basic_chain(self, log: LogFn, drone_ids: Optional[List[int]] = None) -> bool:
         """Create tmux sessions on each drone and start windows 1-7 sequentially.
 
         Window 1 waits 7 seconds before window 2; all later windows wait 3 seconds.
         Windows 8 and 9 are prepared but not executed here.
         Windows definitions are read from each drone's ``windows`` tuple.
         """
+        active_drones = self._get_active_drones(drone_ids)
 
         def build_full_command(setups, cd_cmd, main_cmd):
             parts = [*setups]
@@ -435,9 +447,9 @@ class MissionOrchestrator:
             )
 
         log("[TASK] start_basic_chain 开始")
-        log(f"[TASK] 基础链路将按 {len(self.DRONES)} 架无人机并行启动；单机内部窗口仍保持串行执行")
+        log(f"[TASK] 基础链路将按 {len(active_drones)} 架无人机并行启动；单机内部窗口仍保持串行执行")
 
-        cleared_count = self._cleanup_named_tmux_sessions(log)
+        cleared_count = self._cleanup_named_tmux_sessions(log, drone_ids)
         log(f"[TASK] 预清理完成：共清除 {cleared_count} 个同名 tmux 会话")
 
         results = {}
@@ -519,7 +531,7 @@ class MissionOrchestrator:
                 results[drone.session_name] = result
 
         threads = []
-        for drone in self.DRONES.values():
+        for drone_id, drone in active_drones:
             thread = threading.Thread(target=worker, args=(drone,), daemon=True)
             threads.append(thread)
             thread.start()
@@ -527,15 +539,15 @@ class MissionOrchestrator:
         for thread in threads:
             thread.join()
 
-        all_ok = all(results.get(drone.session_name, False) for drone in self.DRONES.values())
+        all_ok = all(results.get(drone.session_name, False) for drone_id, drone in active_drones)
         log(f"[TASK] start_basic_chain 结束 success={all_ok}")
         return all_ok
 
-    def open_base_chain_terminals(self, log: LogFn) -> bool:
-        """Open local attached terminals for all drone tmux sessions."""
+    def open_base_chain_terminals(self, log: LogFn, drone_ids: Optional[List[int]] = None) -> bool:
+        """Open local attached terminals for selected drone tmux sessions."""
         all_ok = True
         log("[TASK] open_base_chain_terminals 开始")
-        for drone in self.DRONES.values():
+        for drone_id, drone in self._get_active_drones(drone_ids):
             session_ok, _ = self._check_session(drone, log=None)
             if not session_ok:
                 all_ok = False
@@ -549,7 +561,7 @@ class MissionOrchestrator:
         log(f"[TASK] open_base_chain_terminals 结束 success={all_ok}")
         return all_ok
 
-    def trigger_manual_stage(self, stage: str, log: LogFn) -> bool:
+    def trigger_manual_stage(self, stage: str, log: LogFn, drone_ids: Optional[List[int]] = None) -> bool:
         """Trigger manual tmux windows by sending Enter.
 
         stage:
@@ -567,10 +579,10 @@ class MissionOrchestrator:
 
         all_ok = True
         log(f"[TASK] trigger_manual_stage({stage}) 开始")
-        ordered_drone_ids = [drone_id for drone_id in self.manual_stage_start_order if drone_id in self.DRONES]
-        if len(ordered_drone_ids) != len(self.DRONES):
-            remaining_ids = [drone_id for drone_id in self.DRONES if drone_id not in ordered_drone_ids]
-            ordered_drone_ids.extend(remaining_ids)
+        active_set = set(did for did, _ in self._get_active_drones(drone_ids))
+        ordered_drone_ids = [drone_id for drone_id in self.manual_stage_start_order if drone_id in active_set]
+        remaining_ids = [drone_id for drone_id in active_set if drone_id not in ordered_drone_ids]
+        ordered_drone_ids.extend(remaining_ids)
 
         for index, drone_id in enumerate(ordered_drone_ids):
             drone = self.DRONES[drone_id]

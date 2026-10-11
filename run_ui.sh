@@ -101,4 +101,6 @@ fi
 
 # 5) 启动 UI
 log "启动 UI: ${UI_ENTRY}"
+# 解决 WSL2 / Wayland 兼容性问题，强制使用 X11 后端
+export QT_QPA_PLATFORM="${QT_QPA_PLATFORM:-xcb}"
 exec python "${UI_ENTRY}"
