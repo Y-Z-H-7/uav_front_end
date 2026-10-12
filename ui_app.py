@@ -10,6 +10,7 @@ Current scope:
 """
 
 import os
+import subprocess
 import sys
 from datetime import datetime
 from typing import Dict, Optional
@@ -212,7 +213,7 @@ class UAVControlApp(QMainWindow):
         self.auto_ssh_button.setProperty('role','core')
         self.check_ssh_button = QPushButton("检查SSH状态")
         self.check_ssh_button.setProperty('role','core')
-        self.takeoff_seq_button = QPushButton("顺序阶段起飞日志")
+        self.takeoff_seq_button = QPushButton("查看终端")
         self.takeoff_seq_button.setProperty('role','core')
         aux_layout.addWidget(self.auto_ssh_button)
         aux_layout.addWidget(self.check_ssh_button)
@@ -571,30 +572,14 @@ QFrame > QPushButton { background: transparent }
         )
 
     def run_takeoff_sequence(self):
-        """Open attached terminals only if tmux sessions already exist.
-
-        This ensures the operator cannot attach to sessions that have not been
-        created by `start_basic_chain`.
-        """
+        """Open local terminals to attach to each selected drone's tmux session."""
         selected = self._get_selected_drone_ids()
         if not selected:
             self.append_log("[TASK] 未选中任何飞机，已忽略")
             return
         self.append_log(f"[TASK] 目标飞机: {selected}")
-        missing = []
-        for drone in self.mission.DRONES.values():
-            if drone.drone_id not in selected:
-                continue
-            session_ok, _ = self.mission._check_session(drone, log=None)
-            if not session_ok:
-                missing.append(drone.display_name)
-
-        if missing:
-            self.append_log(f"[TASK] 未检测到 tmux 会话: {', '.join(missing)}。请先按“启动基础链路”创建会话，然后重试。")
-            return
-
         self._run_background_task(
-            "open_base_chain_terminals",
+            "open_terminals",
             lambda log: self.mission.open_base_chain_terminals(log, drone_ids=selected),
         )
 
