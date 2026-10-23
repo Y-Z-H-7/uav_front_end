@@ -75,7 +75,7 @@ class LinkUITests(unittest.TestCase):
             )
 
     def test_link_tab_and_rows_are_built_from_specs(self):
-        self.assertEqual(self.window.tabs.count(), 2)
+        self.assertEqual(self.window.tabs.count(), 3)
         self.assertEqual(self.window.tabs.tabText(1), "链路监控")
         self.assertEqual(len(self.window._link_children), len(SPECS))
         self.assertEqual(self.window._link_children[0].text(COL_TOPIC), SPECS[0].topic)

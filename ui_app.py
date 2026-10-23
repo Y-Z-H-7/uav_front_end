@@ -19,6 +19,7 @@ import math
 import os
 import subprocess
 import sys
+import time
 from datetime import datetime, timedelta
 from typing import Dict, Optional
 
@@ -53,6 +54,7 @@ from link_monitor import (
 )
 from mission_orchestrator import MissionOrchestrator
 from ros_adapter import RosAdapter, LANDING_REPEAT_COUNT, LANDING_REPEAT_INTERVAL
+from transfer_controller import TransferController
 
 
 def _format_age(age_s: Optional[float]) -> str:
@@ -70,6 +72,15 @@ def _format_age(age_s: Optional[float]) -> str:
     minutes = int(age_s) // 60
     seconds = int(age_s) % 60
     return f"{minutes}:{seconds:02d}"
+
+
+def _monotonic_deadline(seconds: float) -> float:
+    """图传页异步等待（启动中/停止中）的截止时刻，用 monotonic 不受改表影响。"""
+    return time.monotonic() + seconds
+
+
+def _deadline_passed(deadline: float) -> bool:
+    return time.monotonic() > deadline
 
 
 # 链路监控表格的列序号与表头（折叠树和刷新逻辑共用）
@@ -179,6 +190,10 @@ class UAVControlApp(QMainWindow):
         self.link_monitor = LinkMonitor(self._link_specs)
         self._link_summary_labels: Dict[int, QLabel] = {}
         self._link_status_cache: Dict[int, str] = {}
+
+        # 图传（UAVLink）控制：照片/视频传输的启停。控制器只读写
+        # ~/Workspace/UAVLink，与 ROS 无关；找不到安装目录时本页降级为提示。
+        self.transfer = TransferController()
 
         # 连接信号与槽：当后端线程或 ROS 回调发出信号时，UI 会更新日志和状态卡。
         self.ros_log_signal.connect(self.append_log)
@@ -382,6 +397,7 @@ class UAVControlApp(QMainWindow):
 
         self.tabs.addTab(control_page, "任务控制")
         self.tabs.addTab(self._build_link_page(), "链路监控")
+        self.tabs.addTab(self._build_transfer_page(), "图传控制")
         outer_layout.addWidget(self.tabs)
 
         self.setCentralWidget(central_widget)
@@ -492,6 +508,13 @@ QFrame > QPushButton { background: transparent }
         self._link_timer.setInterval(500)
         self._link_timer.timeout.connect(self._refresh_link_view)
         self._link_timer.start()
+
+        # 图传页的状态轮询：只读 active.json（主程序每 5 秒写一次），开销极小。
+        # 2 秒的刷新间隔能让启停按钮的状态及时跟上。
+        self._transfer_timer = QTimer(self)
+        self._transfer_timer.setInterval(2000)
+        self._transfer_timer.timeout.connect(self._refresh_transfer_view)
+        self._transfer_timer.start()
 
     def _toggle_drone_selection(self, drone_id: int):
         """切换指定无人机的选中状态。
@@ -1059,6 +1082,280 @@ QFrame > QPushButton { background: transparent }
         self.link_monitor.reset()
         self._link_status_cache.clear()
         self.append_log("[LINK] 链路统计已清零，开始新的统计窗口。")
+
+    # ------------------------------------------------------------------
+    # 图传控制（UAVLink 照片/视频传输）
+    # ------------------------------------------------------------------
+    def _build_transfer_page(self) -> QWidget:
+        """构建“图传控制”标签页：照片启停 + 三机视频启停 + 逐机状态 + 事件日志。"""
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(16, 12, 16, 12)
+        layout.setSpacing(8)
+
+        header = QHBoxLayout()
+        title = QLabel("图像传输控制（照片 / 视频）")
+        title.setStyleSheet("font-size: 18px; font-weight: 600;")
+        header.addWidget(title)
+        header.addStretch()
+        layout.addLayout(header)
+
+        hint = QLabel(
+            "照片传输由 start_photos.sh 主程序负责：自动探测在线飞机，机载每秒存一张、"
+            "每 3 秒回传一张，前端退出不影响其运行。视频为单会话预览（关闭预览窗口或"
+            "“停止视频”只停视频、照片继续）；当前系统仅开放 nuc2 视频。"
+            "停止照片传输会等在途照片落盘并撤销机载限速规则后再退出。"
+        )
+        hint.setObjectName("linkHint")
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
+
+        # UAVLink 未安装时（例如在开发机上跑界面）整页只留提示，按钮全部禁用。
+        self._transfer_available = self.transfer.available
+        if not self._transfer_available:
+            unavailable = QLabel(self.transfer.hint)
+            unavailable.setObjectName("linkHint")
+            unavailable.setWordWrap(True)
+            layout.addWidget(unavailable)
+
+        # ---- 照片组 ----
+        photos_frame = QFrame()
+        photos_frame.setObjectName("gcsFrame")
+        photos_layout = QHBoxLayout(photos_frame)
+        photos_layout.setSpacing(8)
+        self.transfer_photos_status = QLabel("照片传输：未知")
+        self.transfer_photos_status.setObjectName("linkSummary")
+        self.transfer_photos_status.setMinimumWidth(420)
+        self.transfer_photos_status.setWordWrap(True)
+        self.transfer_photos_start_button = QPushButton("启动照片传输")
+        self.transfer_photos_start_button.setProperty("role", "core")
+        self.transfer_photos_start_button.clicked.connect(
+            lambda *_: self._transfer_start_photos())
+        self.transfer_photos_stop_button = QPushButton("停止照片传输")
+        self.transfer_photos_stop_button.setProperty("role", "end")
+        self.transfer_photos_stop_button.clicked.connect(
+            lambda *_: self._transfer_stop_photos())
+        photos_layout.addWidget(self.transfer_photos_status, 1)
+        photos_layout.addWidget(self.transfer_photos_start_button)
+        photos_layout.addWidget(self.transfer_photos_stop_button)
+        layout.addWidget(photos_frame)
+
+        # ---- 视频组 ----
+        video_frame = QFrame()
+        video_frame.setObjectName("gcsFrame")
+        video_layout = QHBoxLayout(video_frame)
+        video_layout.setSpacing(8)
+        self.transfer_video_status = QLabel("视频预览：未知")
+        self.transfer_video_status.setObjectName("linkSummary")
+        self.transfer_video_status.setMinimumWidth(420)
+        self.transfer_video_status.setWordWrap(True)
+        self.transfer_video_stop_button = QPushButton("停止视频")
+        self.transfer_video_stop_button.setProperty("role", "end")
+        self.transfer_video_stop_button.clicked.connect(
+            lambda *_: self._transfer_stop_video())
+        video_layout.addWidget(self.transfer_video_status, 1)
+        # 每架飞机一个启动按钮，顺序与任务控制页一致（nuc/fly/nuc2 = 1/2/3 号机）。
+        self._transfer_video_buttons: Dict[str, QPushButton] = {}
+        for drone_id in sorted(self.mission.DRONES.keys()):
+            name = self.mission.DRONES[drone_id].display_name
+            button = QPushButton(f"启动 {name} 视频（{drone_id}号机）")
+            button.setProperty("role", "core")
+            button.setToolTip("需要照片主程序已启动；当前系统仅开放 nuc2 视频")
+            button.clicked.connect(
+                lambda *_, n=name: self._transfer_start_video(n))
+            self._transfer_video_buttons[name] = button
+            video_layout.addWidget(button)
+        video_layout.addWidget(self.transfer_video_stop_button)
+        layout.addWidget(video_frame)
+
+        # ---- 逐机照片状态 ----
+        drone_row = QHBoxLayout()
+        drone_row.setSpacing(24)
+        self._transfer_drone_labels: Dict[str, QLabel] = {}
+        for drone_id in sorted(self.mission.DRONES.keys()):
+            name = self.mission.DRONES[drone_id].display_name
+            label = QLabel(f"{name}（{drone_id}号机）：--")
+            label.setObjectName("linkSummary")
+            self._transfer_drone_labels[name] = label
+            drone_row.addWidget(label)
+        drone_row.addStretch()
+        layout.addLayout(drone_row)
+
+        # ---- 本页事件日志（同时镜像到主日志文件） ----
+        self.transfer_log_view = QTextEdit()
+        self.transfer_log_view.setReadOnly(True)
+        self.transfer_log_view.setObjectName("logView")
+        self.transfer_log_view.setPlaceholderText("图传启停与状态事件会显示在这里")
+        layout.addWidget(self.transfer_log_view, 1)
+
+        # 界面退出不带走图传；但启停操作期间要防连点。
+        self._transfer_busy_buttons: set = set()
+        self._transfer_workers: list = []
+        # 启动/停止是异步生效的（启动要 ~10s 探测、停止要 ~1min 收尾），
+        # 用 (动作, 截止时刻) 记录等待状态，超时后回到普通显示。
+        self._transfer_pending: Optional[tuple] = None
+        self._refresh_transfer_view()
+        return page
+
+    def _transfer_log(self, message: str) -> None:
+        """图传页日志：写本页文本框，同时走统一日志入口（时间戳 + 文件）。"""
+        if hasattr(self, "transfer_log_view"):
+            timestamp = datetime.now().strftime("%H:%M:%S")
+            self.transfer_log_view.append(f"[{timestamp}] {message}")
+        self.append_log(f"[图传] {message}")
+
+    def _refresh_transfer_view(self) -> None:
+        """定时器回调：读 active.json 刷新照片/视频状态与按钮可用性。"""
+        if not hasattr(self, "transfer_photos_status"):
+            return
+        status = self.transfer.read_status()
+        state = status["state"] or {}
+        running = bool(status["running"])
+        stale = bool(status["stale"])
+
+        # 等待中的启动/停止已经生效（或超时）就清掉标记。
+        pending = self._transfer_pending
+        if pending:
+            action, deadline = pending
+            if _deadline_passed(deadline):
+                self._transfer_pending = None
+            elif action == "starting" and (running or stale):
+                self._transfer_pending = None
+            elif action == "stopping" and not running and not stale:
+                self._transfer_pending = None
+        pending = self._transfer_pending
+
+        # ---- 照片状态行 ----
+        if pending and pending[0] == "starting":
+            photos_text = "照片传输：启动中（首次在线探测约 10 秒）…"
+        elif pending and pending[0] == "stopping":
+            photos_text = "照片传输：停止中（等待在途照片落盘与限速规则撤销，最长约 1 分钟）…"
+        elif running:
+            total = 0
+            for item in self.transfer.summarize_drones(state):
+                if isinstance(item.get("received"), int):
+                    total += item["received"]
+            session = str(state.get("session") or "--")
+            photos_text = f"照片传输：运行中 · 已收到 {total} 张 · 会话 {session}"
+        elif stale:
+            age = status["age_s"]
+            age_text = f"{int(age)}s" if isinstance(age, (int, float)) else "?"
+            photos_text = f"照片传输：无响应（状态文件 {age_text} 未更新，可能正在长时间探测）"
+        else:
+            photos_text = "照片传输：未运行"
+        self.transfer_photos_status.setText(photos_text)
+
+        # ---- 视频状态行 ----
+        video = state.get("video") if isinstance(state, dict) else None
+        if pending and pending[0] == "stopping":
+            video_text = "视频预览：停止中…"
+        elif isinstance(video, dict):
+            video_text = (
+                f"视频预览：运行中 · {video.get('name', '?')}号源"
+                f"（{video.get('key', '--')}），关闭预览窗口也会自动停止"
+            )
+        else:
+            video_text = "视频预览：未运行"
+        self.transfer_video_status.setText(video_text)
+
+        # ---- 逐机行 ----
+        summaries = {item["name"]: item for item in self.transfer.summarize_drones(state)}
+        for name, label in self._transfer_drone_labels.items():
+            item = summaries.get(name)
+            if not item:
+                label.setText(f"{name}：--")
+                continue
+            online_text = "在线" if item["online"] else "离线"
+            saved = item.get("saved")
+            received = item.get("received")
+            counts = []
+            if isinstance(saved, int):
+                counts.append(f"机载已存 {saved}")
+            if isinstance(received, int):
+                counts.append(f"收到 {received}")
+            suffix = " · ".join(counts)
+            label.setText(f"{name}：{online_text}" + (f" · {suffix}" if suffix else ""))
+
+        # ---- 按钮可用性 ----
+        # 操作进行中的按钮保持禁用（_transfer_busy_buttons）。
+        busy = self._transfer_busy_buttons
+        self.transfer_photos_start_button.setEnabled(
+            self._transfer_available and running is False and stale is False
+            and not (pending and pending[0] == "starting")
+            and self.transfer_photos_start_button not in busy)
+        self.transfer_photos_stop_button.setEnabled(
+            self._transfer_available and (running or stale)
+            and not (pending and pending[0] == "stopping")
+            and self.transfer_photos_stop_button not in busy)
+        video_running = isinstance(video, dict)
+        for name, button in self._transfer_video_buttons.items():
+            button.setEnabled(
+                self._transfer_available and running and not video_running
+                and button not in busy)
+        self.transfer_video_stop_button.setEnabled(
+            self._transfer_available and video_running
+            and self.transfer_video_stop_button not in busy)
+
+    def _run_transfer_task(self, button, action: str, fn) -> None:
+        """后台执行一个图传操作（video-start 最长可达 1 分钟，不能卡 UI）。
+
+        与 _run_background_task 不同，这里只禁用相关按钮，不锁整个界面的
+        任务按钮：图传与 SSH 编排互不干扰，可以一边传照片一边做别的。
+        """
+        if button not in self._transfer_busy_buttons:
+            button.setEnabled(False)
+            self._transfer_busy_buttons.add(button)
+
+        def task(log):
+            ok, message = fn()
+            log(f"{action}：{message}")
+            return ok
+
+        worker = TaskWorker(task)
+        worker.log_signal.connect(self._transfer_log)
+        worker.finished_signal.connect(
+            lambda ok, b=button, a=action: self._on_transfer_task_finished(b, a, ok))
+        worker.finished.connect(worker.deleteLater)
+        self._transfer_workers.append(worker)
+        worker.start()
+
+    def _on_transfer_task_finished(self, button, action: str, ok: bool) -> None:
+        self._transfer_busy_buttons.discard(button)
+        # 列表仅持引用防 GC；完成的线程对象清掉，长度有界。
+        self._transfer_workers = [w for w in self._transfer_workers if w.isRunning()]
+        self._transfer_log(f"{action} 完成（success={ok}）")
+        self._refresh_transfer_view()
+
+    def _transfer_start_photos(self) -> None:
+        if self._transfer_pending and self._transfer_pending[0] == "starting":
+            return
+        # 启动是 Popen 立即返回的，但主程序要 ~10 秒才写出 active.json，
+        # 用 pending 状态防止这段时间里重复点击。
+        self._transfer_pending = ("starting", _monotonic_deadline(30))
+        self._run_transfer_task(
+            self.transfer_photos_start_button, "启动照片传输",
+            self.transfer.start_photos)
+
+    def _transfer_stop_photos(self) -> None:
+        if self._transfer_pending and self._transfer_pending[0] == "stopping":
+            return
+        self._transfer_pending = ("stopping", _monotonic_deadline(120))
+        self._run_transfer_task(
+            self.transfer_photos_stop_button, "停止照片传输",
+            self.transfer.stop_photos)
+
+    def _transfer_start_video(self, name: str) -> None:
+        button = self._transfer_video_buttons.get(name)
+        if button is None:
+            return
+        self._run_transfer_task(
+            button, f"启动 {name} 视频",
+            lambda: self.transfer.start_video(name))
+
+    def _transfer_stop_video(self) -> None:
+        self._run_transfer_task(
+            self.transfer_video_stop_button, "停止视频",
+            self.transfer.stop_video)
 
 
 
