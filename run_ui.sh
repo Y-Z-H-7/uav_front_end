@@ -10,6 +10,11 @@
 
 set -euo pipefail
 
+# 允许从干净的 WSL shell 启动；ROS 的环境脚本在 nounset 模式下
+# 会读取这些变量。
+export ROS_DISTRO="${ROS_DISTRO:-noetic}"
+export ROS_MASTER_URI="${ROS_MASTER_URI:-http://localhost:11311}"
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROS_SETUP="/opt/ros/noetic/setup.bash"
 VENV_PATH="${SCRIPT_DIR}/.venv"
@@ -59,10 +64,22 @@ log "ROS 环境已加载: ${ROS_SETUP}"
 source "${VENV_PATH}/bin/activate"
 log "虚拟环境已激活: ${VENV_PATH}"
 
+# Debian/Ubuntu 的 ROS Python 包位于系统 dist-packages；部分通过旧路径
+# 创建的虚拟环境不会自动继承该目录，因此显式加入 ROS 的 Python 路径。
+ROS_PYTHON_PATHS=(
+  "/opt/ros/noetic/lib/python3/dist-packages"
+  "/usr/lib/python3/dist-packages"
+)
+for ROS_PYTHON_PATH in "${ROS_PYTHON_PATHS[@]}"; do
+  if [[ -d "${ROS_PYTHON_PATH}" ]]; then
+    export PYTHONPATH="${ROS_PYTHON_PATH}${PYTHONPATH:+:${PYTHONPATH}}"
+  fi
+done
+
 # 3) 依赖自检（快速失败，避免 UI 启动后才报错）
 python - <<'PY'
 import importlib
-mods = ["rospy", "rospkg", "PySide6"]
+mods = ["rospy", "rospkg", "PySide6", "sensor_msgs.msg", "geometry_msgs.msg", "std_msgs.msg"]
 missing = []
 for m in mods:
     try:
@@ -71,7 +88,7 @@ for m in mods:
         missing.append(m)
 if missing:
     raise SystemExit("缺少依赖: " + ", ".join(missing))
-print("依赖检查通过: rospy, rospkg, PySide6")
+print("依赖检查通过: " + ", ".join(mods))
 PY
 
 # 4) 自动拉起 roscore（如果 master 未运行）

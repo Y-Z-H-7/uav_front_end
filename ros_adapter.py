@@ -14,11 +14,8 @@ ROS 适配层：统一负责"发布控制请求、订阅状态（后续可扩展
 - 跨机数据转发由 swarm_ros_bridge 负责。
 """
 
+import math
 import time
-
-from sensor_msgs.msg import BatteryState
-
-from geometry_msgs.msg import PoseStamped
 
 from typing import Callable, Dict, Iterable, Optional
 
@@ -27,12 +24,18 @@ from PySide6.QtCore import QThread, Signal
 try:
     import rospy
     from std_msgs.msg import Bool
+    from sensor_msgs.msg import BatteryState
+    from geometry_msgs.msg import PoseStamped
 
     ROS_AVAILABLE = True
-except Exception:
+    ROS_IMPORT_ERROR = ""
+except Exception as exc:
     rospy = None
     Bool = None
+    BatteryState = None
+    PoseStamped = None
     ROS_AVAILABLE = False
+    ROS_IMPORT_ERROR = str(exc)
 
 
 # 连发参数：保证UDP丢包场景下消息能到达飞机
@@ -92,10 +95,15 @@ class RosAdapter:
         landing_topics: Optional[Dict[int, str]] = None,
         battery_callback: Optional[Callable[[int, float, float], None]] = None,
         pose_callback: Optional[Callable[[int, float, float, float], None]] = None,
+        link_monitor=None,
     ):
         self.log_callback = log_callback or (lambda message: None)
         self.battery_callback = battery_callback or (lambda uav_id, pct, volt: None)
         self.pose_callback = pose_callback or (lambda uav_id, x, y, z: None)
+
+        # 链路监测器（link_monitor.LinkMonitor）；为 None 时不做任何额外订阅。
+        # 电量/位姿的回调里顺手上报一次到达，其余主题用 AnyMsg 订阅后上报。
+        self.link_monitor = link_monitor
 
         # 这些 topic 可由 swarm_ros_bridge 转发到目标无人机。
         self.landing_topics = landing_topics or {
@@ -113,7 +121,7 @@ class RosAdapter:
         self._subs = []
 
         if not ROS_AVAILABLE:
-            self._log("ROS 环境不可用，当前以占位模式运行。")
+            self._log(f"ROS 环境不可用，无法接收遥测：{ROS_IMPORT_ERROR}")
             return
 
         try:
@@ -128,8 +136,8 @@ class RosAdapter:
             for uav_id, topic in self.landing_topics.items():
                 self.publishers[uav_id] = rospy.Publisher(topic, Bool, queue_size=10)
 
-            self.ros_ready = True
             self._log("ROS 适配层已初始化（Bool 触发模式，连发提高可靠性）。")
+            self._log(f"遥测使用 ROS master：{_master_uri()}")
             
             for uav_id in sorted(self.landing_topics.keys()):
                 ns = f"uav{uav_id}"
@@ -149,8 +157,13 @@ class RosAdapter:
                     queue_size=1,
                 ))
 
-            self._log("已订阅 /uavX/mavros/battery。")
-            self._log("已订阅 /uavX/mavros/local_position/pose。")
+            self.ros_ready = True
+            self._subscribe_link_topics()
+            for uav_id in sorted(self.landing_topics):
+                self._log(
+                    f"等待 {uav_id} 号机遥测：/uav{uav_id}/mavros/battery、"
+                    f"/uav{uav_id}/mavros/local_position/pose"
+                )
 
         except Exception as exc:
             self.ros_ready = False
@@ -158,30 +171,100 @@ class RosAdapter:
 
     def _log(self, message: str) -> None:
         self.log_callback(message)
-    
-    def _make_battery_cb(self, uav_id, ns):
-        import time
-        last = [0.0]
+
+    # ------------------------------------------------------------------
+    # 链路监测
+    # ------------------------------------------------------------------
+    def _subscribe_link_topics(self) -> None:
+        """为链路监测订阅“其余”主题。
+
+        电量/位姿已经有强类型订阅（能拿到 header 时间戳，可以算时延），
+        这里只处理剩下那些不需要反序列化的主题：用 rospy.AnyMsg 订阅，
+        回调里只取 ``len(msg._buff)``，既拿到了链路上真实的载荷字节数，
+        又不用导入 exploration_manager / bspline / plan_env 这些自定义消息包
+        （前端虚拟环境里往往没有 source 过 RACER 工作空间）。
+        """
+        monitor = self.link_monitor
+        if monitor is None:
+            return
+        any_msg = getattr(rospy, "AnyMsg", None)
+        if any_msg is None:
+            self._log("当前 rospy 不支持 AnyMsg，链路监控只统计电量/位姿主题。")
+            return
+        subscribed = 0
+        for spec in monitor.specs():
+            if spec.has_stamp:
+                continue
+            try:
+                sub = rospy.Subscriber(
+                    spec.topic,
+                    any_msg,
+                    self._make_raw_link_cb(spec),
+                    queue_size=1,
+                )
+            except Exception as exc:
+                self._log(f"链路监控订阅失败：{spec.topic}（{exc}）")
+                continue
+            self._subs.append(sub)
+            subscribed += 1
+        if subscribed:
+            self._log(f"链路监控已订阅 {subscribed} 条原始主题（AnyMsg，不反序列化）。")
+
+    def _make_raw_link_cb(self, spec):
+        monitor = self.link_monitor
+
         def cb(msg):
-            now = time.time()
-            if now - last[0] < 1.0:   # 1Hz 节流
+            try:
+                monitor.record(spec.drone_id, spec.topic, len(getattr(msg, "_buff", b"") or b""))
+            except Exception:
+                # 监测永远不能影响主链路或 ROS 回调线程，异常直接吞掉。
+                pass
+
+        return cb
+
+    def _record_link(self, drone_id: int, topic: str, msg) -> None:
+        """强类型回调里上报一次到达（带时间戳时可以算时延）。"""
+        monitor = self.link_monitor
+        if monitor is None:
+            return
+        try:
+            monitor.record(drone_id, topic, _serialized_size(msg), stamp_sec=_header_stamp(msg))
+        except Exception:
+            pass
+
+    def _make_battery_cb(self, uav_id, ns):
+        topic = f"/{ns}/mavros/battery"
+        last = [None]
+        def cb(msg):
+            # 先上报链路统计，再按 1Hz 节流刷新界面：节流只该影响显示，
+            # 不该让监测少统计消息。
+            self._record_link(uav_id, topic, msg)
+            now = time.monotonic()
+            if last[0] is not None and now - last[0] < 1.0:   # 1Hz 节流
                 return
+            if last[0] is None:
+                self._log(f"已收到 {uav_id} 号机电量：{topic}")
             last[0] = now
             pct = msg.percentage
-            if pct != pct:
+            if not math.isfinite(pct) or not 0.0 <= pct <= 1.0:
                 pct = -1.0
             self.battery_callback(uav_id, pct, msg.voltage)
         return cb
-    
+
     def _make_pose_cb(self, uav_id):
-        import time
-        last = [0.0]
+        topic = f"/uav{uav_id}/mavros/local_position/pose"
+        last = [None]
         def cb(msg):
-            now = time.time()
-            if now - last[0] < 0.2:   # 5Hz
+            self._record_link(uav_id, topic, msg)
+            now = time.monotonic()
+            if last[0] is not None and now - last[0] < 0.2:   # 5Hz
                 return
-            last[0] = now
             p = msg.pose.position
+            if not all(math.isfinite(v) for v in (p.x, p.y, p.z)):
+                return
+            if last[0] is None:
+                self._log(f"已收到 {uav_id} 号机位置：{topic}")
+            last[0] = now
             self.pose_callback(uav_id, p.x, p.y, p.z)
         return cb
 
@@ -237,3 +320,66 @@ class RosAdapter:
             thread.start()
 
         return success
+
+
+# ----------------------------------------------------------------------
+# 链路监测用到的小工具
+# ----------------------------------------------------------------------
+def _serialized_size(msg) -> int:
+    """消息序列化后的字节数，即链路上实际传输的载荷大小。
+
+    genpy 的 ``serialize(buff)`` **必须**传入 buffer（没有默认值），直接调
+    ``msg.serialize()`` 会抛 TypeError；以前就是这样一路 fallback 到 0，
+    导致电量/位姿的带宽恒为 0.00。
+    """
+    try:
+        from io import BytesIO
+
+        buff = BytesIO()
+        msg.serialize(buff)
+        return len(buff.getvalue())
+    except Exception:
+        pass
+    try:
+        data = msg.serialize()          # 某些自定义消息允许不传 buffer
+        if data is not None:
+            return len(data)
+    except Exception:
+        pass
+    try:
+        return len(getattr(msg, "_buff", b"") or b"")
+    except Exception:
+        return 0
+
+
+def _header_stamp(msg) -> Optional[float]:
+    """取消息 header.stamp 的秒数；没有 header 时返回 None。"""
+    header = getattr(msg, "header", None)
+    stamp = getattr(header, "stamp", None)
+    if stamp is None:
+        return None
+    try:
+        return float(stamp.to_sec())
+    except Exception:
+        pass
+    try:
+        return float(getattr(stamp, "secs")) + float(getattr(stamp, "nsecs")) * 1e-9
+    except Exception:
+        return None
+
+
+def _master_uri() -> str:
+    """取 master 地址。
+
+    rosgraph 的 ``getUri()`` 实际返回的是 XML-RPC 响应三元组
+    ``[code, statusMessage, uri]``，直接格式化会打出 ``[1, '', 'http://...']``，
+    这里把它拆成纯地址。
+    """
+    try:
+        result = rospy.get_master().getUri()
+    except Exception:
+        return "未知（无法连接 master）"
+    if isinstance(result, (list, tuple)) and len(result) == 3:
+        return str(result[2])
+    return str(result)
+

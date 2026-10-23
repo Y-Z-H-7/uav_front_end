@@ -12,6 +12,8 @@ __pycache__/
 build/
 dist/
 *.log
+# 链路监控导出的快照
+logs/*.csv
 
 # Editor and OS files
 .vscode/
