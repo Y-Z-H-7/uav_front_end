@@ -95,6 +95,13 @@ class TelemetryUITests(unittest.TestCase):
         self.assertEqual(self.window._status_cards[2]["battery"].text(), "电量: --  (--V)")
         self.assertEqual(self.window._status_cards[2]["position"].text(), "位置: --")
 
+    def test_px4_unknown_voltage_sentinel_is_not_displayed(self):
+        # 飞控没测到电压时 PX4 填 65535 mV，MAVROS 转成 65.535 V；
+        # 这是“无读数”而不是一块 65V 电池，必须显示成 --V。
+        self.deliver("battery", SimpleNamespace(percentage=-0.01, voltage=65.535))
+        self.app.processEvents()
+        self.assertEqual(self.window._status_cards[2]["battery"].text(), "电量: --  (--V)")
+
     def test_receiving_telemetry_does_not_depend_on_selection(self):
         self.window._toggle_drone_selection(2)
         self.deliver("battery", SimpleNamespace(percentage=0.5, voltage=15.0))

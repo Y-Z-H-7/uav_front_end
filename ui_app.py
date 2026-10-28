@@ -568,7 +568,11 @@ QFrame > QPushButton { background: transparent }
         if not card or "battery" not in card:
             return
         percentage = f"{pct*100:.0f}%" if math.isfinite(pct) and 0 <= pct <= 1 else "--"
-        voltage = f"{volt:.2f}V" if math.isfinite(volt) and volt > 0 else "--V"
+        # 飞控没测到电压时会填 65535 mV（PX4 的 UINT16_MAX 哨兵），MAVROS 转成
+        # 65.535 V。这个值必须当无效处理，否则界面会显示"电量: -- (65.54V)"，
+        # 比直接显示 -- 更误导。上限按 12S 电池留足余量。
+        volt_ok = math.isfinite(volt) and 0 < volt <= 60
+        voltage = f"{volt:.2f}V" if volt_ok else "--V"
         text = f"电量: {percentage}  ({voltage})"
         card["battery"].setText(text)
 
