@@ -235,20 +235,41 @@ class RosAdapter:
     def _make_battery_cb(self, uav_id, ns):
         topic = f"/{ns}/mavros/battery"
         last = [None]
+        seen = {"valid": False, "invalid": False}
+
         def cb(msg):
             # 先上报链路统计，再按 1Hz 节流刷新界面：节流只该影响显示，
             # 不该让监测少统计消息。
             self._record_link(uav_id, topic, msg)
+            pct = msg.percentage
+            volt = getattr(msg, "voltage", float("nan"))
+            cells = len(getattr(msg, "cell_voltage", ()) or ())
+            valid = math.isfinite(pct) and 0.0 <= pct <= 1.0
+
+            # 电量显示不出来时，日志里至少要能看出是“没收到”还是“收到空数据”。
+            # 每种状态每次运行只打一条，避免刷屏。
+            if not valid and not seen["invalid"]:
+                seen["invalid"] = True
+                self._log(
+                    f"⚠ {uav_id} 号机电量数据无效：percentage={pct} "
+                    f"voltage={volt} 电芯数={cells}（继续等待有效样本）"
+                )
+            elif valid and not seen["valid"]:
+                seen["valid"] = True
+                self._log(
+                    f"✓ {uav_id} 号机电量有效：{pct * 100:.0f}% "
+                    f"{volt:.2f}V 电芯数={cells}"
+                )
+
             now = time.monotonic()
             if last[0] is not None and now - last[0] < 1.0:   # 1Hz 节流
                 return
             if last[0] is None:
                 self._log(f"已收到 {uav_id} 号机电量：{topic}")
             last[0] = now
-            pct = msg.percentage
-            if not math.isfinite(pct) or not 0.0 <= pct <= 1.0:
+            if not valid:
                 pct = -1.0
-            self.battery_callback(uav_id, pct, msg.voltage)
+            self.battery_callback(uav_id, pct, volt)
         return cb
 
     def _make_pose_cb(self, uav_id):
