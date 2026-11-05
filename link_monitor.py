@@ -27,6 +27,7 @@
 from __future__ import annotations
 
 import csv
+from datetime import datetime
 import os
 import statistics
 import threading
@@ -123,6 +124,9 @@ class LinkRow:
     direction: str
     hz: float
     kbytes_per_s: float
+    peak_kbytes_per_s: float
+    peak_at: Optional[float]
+    peak_wall_time: Optional[float]
     latency_ms: Optional[float]
     jitter_ms: Optional[float]
     age_s: Optional[float]
@@ -139,6 +143,7 @@ class _TopicState:
     __slots__ = (
         "window", "samples", "total_samples",
         "last_t", "last_delay", "delays", "peak_hz", "prev_t", "first_t",
+        "peak_kbytes_per_s", "peak_at", "peak_wall_time",
     )
 
     def __init__(self, window: float) -> None:
@@ -149,6 +154,9 @@ class _TopicState:
         self.last_delay: Optional[float] = None
         self.delays: Deque[Tuple[float, float]] = deque()
         self.peak_hz = 0.0
+        self.peak_kbytes_per_s = 0.0
+        self.peak_at: Optional[float] = None
+        self.peak_wall_time: Optional[float] = None
         # 被窗口挤出去的最后一条消息时刻，用来给“窗口里只剩一条”的慢主题
         # 估算频率；first_t 是这个主题第一次收到消息的时刻。
         self.prev_t: Optional[float] = None
@@ -249,9 +257,11 @@ class LinkMonitor:
                 self._states[key] = _TopicState(self._window)
 
     # ------------------------------------------------------------------ 快照
-    def snapshot(self, now: Optional[float] = None) -> List[LinkRow]:
+    def snapshot(self, now: Optional[float] = None,
+                 wall_time: Optional[float] = None) -> List[LinkRow]:
         """按配置顺序返回所有主题的当前指标。"""
         now = time.monotonic() if now is None else now
+        wall = time.time() if wall_time is None else wall_time
         rows: List[LinkRow] = []
         with self._lock:
             for key in self._order:
@@ -289,6 +299,12 @@ class LinkMonitor:
                     kbps = sum(b for _, b in st.samples) / elapsed / 1024.0
                 else:
                     kbps = 0.0
+                # 峰值只在 2 秒窗口攒满后更新，避免刚启动时一两个大包
+                # 被 0.2 秒的临时分母放大成虚假最大值。
+                if window_full and n and kbps > st.peak_kbytes_per_s:
+                    st.peak_kbytes_per_s = kbps
+                    st.peak_at = now
+                    st.peak_wall_time = wall
 
                 age = None if st.last_t is None else max(0.0, now - st.last_t)
                 jitter = _gap_stdev_ms(st.samples)
@@ -306,6 +322,9 @@ class LinkMonitor:
                         direction=spec.direction,
                         hz=hz,
                         kbytes_per_s=kbps,
+                        peak_kbytes_per_s=st.peak_kbytes_per_s,
+                        peak_at=st.peak_at,
+                        peak_wall_time=st.peak_wall_time,
                         latency_ms=latency,
                         jitter_ms=jitter,
                         age_s=age,
@@ -369,13 +388,17 @@ class LinkMonitor:
             writer = csv.writer(fh)
             writer.writerow([
                 "drone_id", "topic", "msg_type", "direction",
-                "hz", "kbytes_per_s", "latency_ms", "jitter_ms",
+                "hz", "kbytes_per_s", "peak_kbytes_per_s", "peak_time_local",
+                "latency_ms", "jitter_ms",
                 "age_s", "offset_ms", "peak_hz", "samples", "status",
             ])
             for row in rows:
                 writer.writerow([
                     row.drone_id, row.topic, row.msg_type, row.direction,
                     f"{row.hz:.2f}", f"{row.kbytes_per_s:.2f}",
+                    f"{row.peak_kbytes_per_s:.2f}",
+                    "" if row.peak_wall_time is None else
+                    datetime.fromtimestamp(row.peak_wall_time).isoformat(timespec="seconds"),
                     "" if row.latency_ms is None else f"{row.latency_ms:.1f}",
                     "" if row.jitter_ms is None else f"{row.jitter_ms:.1f}",
                     "" if row.age_s is None else f"{row.age_s:.2f}",

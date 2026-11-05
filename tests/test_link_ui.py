@@ -4,6 +4,7 @@
 import contextlib
 import io
 import os
+import tempfile
 from pathlib import Path
 import sys
 import time
@@ -20,7 +21,7 @@ import ui_app
 from link_monitor import STATUS_OK, STATUS_WAITING, LinkTopicSpec
 from ui_app import (
     LINK_HEADERS,
-    COL_AGE, COL_DESC, COL_HZ, COL_KBPS, COL_STATUS, COL_TOPIC, UAVControlApp,
+    COL_AGE, COL_DESC, COL_HZ, COL_KBPS, COL_PEAK_KBPS, COL_STATUS, COL_TOPIC, UAVControlApp,
 )
 
 SPECS = [
@@ -132,11 +133,42 @@ class LinkUITests(unittest.TestCase):
         self.window._refresh_link_view()
         self.assertEqual(self.window._link_children[0].text(COL_HZ), "--")
         self.assertEqual(self.window._link_children[0].text(COL_STATUS), STATUS_WAITING)
+        self.assertEqual(self.window._link_children[0].text(COL_PEAK_KBPS), "--")
         self.assertIn("等待数据", self.window._link_summary_labels[1].text())
 
     def test_startup_log_reports_missing_bridge_config(self):
         text = self.window.log_view.toPlainText()
         self.assertIn("[LINK] 未找到桥接配置", text)
+
+    def test_peak_bandwidth_column_retains_session_maximum(self):
+        now = time.monotonic()
+        for i in range(25):
+            self.window.link_monitor.record(
+                1, SPECS[0].topic, 1024, recv_time=now - 2.5 + i * 0.1)
+        self.window._refresh_link_view()
+        peak_text = self.window._link_children[0].text(COL_PEAK_KBPS)
+        self.assertGreater(float(peak_text), 0)
+        self.assertIn("峰值时间", self.window._link_children[0].toolTip(COL_PEAK_KBPS))
+        self.window._refresh_link_view()
+        self.assertEqual(self.window._link_children[0].text(COL_PEAK_KBPS), peak_text)
+
+    def test_export_writes_current_and_peak_context_csv(self):
+        now = time.monotonic()
+        for i in range(25):
+            self.window.link_monitor.record(
+                1, SPECS[0].topic, 1024, recv_time=now - 2.5 + i * 0.1)
+        self.window._refresh_link_view()
+        with tempfile.TemporaryDirectory() as folder:
+            with patch.object(ui_app, "__file__", os.path.join(folder, "ui_app.py")):
+                self.window._export_link_csv()
+            files = sorted(os.listdir(os.path.join(folder, "logs")))
+            self.assertEqual(len(files), 2)
+            self.assertTrue(any(name.startswith("link_monitor_") for name in files))
+            context = next(name for name in files if name.startswith("link_peak_context_"))
+            with open(os.path.join(folder, "logs", context), encoding="utf-8-sig") as source:
+                text = source.read()
+            self.assertIn("peak_topic", text)
+            self.assertIn(SPECS[0].topic, text)
 
     def test_link_columns_are_draggable(self):
         # 之前除主题/说明外的列都是 ResizeToContents，Qt 不允许手动拖宽

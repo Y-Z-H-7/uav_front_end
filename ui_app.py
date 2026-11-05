@@ -52,6 +52,7 @@ from link_monitor import (
     LinkMonitor,
     build_link_specs,
 )
+from link_peak_context import PeakContextRecorder
 from battery_monitor import BatteryMonitor
 from battery_history import BatteryHistoryRecorder
 from mission_orchestrator import MissionOrchestrator
@@ -94,15 +95,16 @@ def _deadline_passed(deadline: float) -> bool:
     COL_TYPE,
     COL_HZ,
     COL_KBPS,
+    COL_PEAK_KBPS,
     COL_LAT,
     COL_JIT,
     COL_AGE,
     COL_STATUS,
-) = range(10)
+) = range(11)
 
 LINK_HEADERS = (
     "飞机", "主题", "说明", "消息类型",
-    "频率 Hz", "带宽 KB/s", "时延 ms", "抖动 ms", "静默 s", "状态",
+    "频率 Hz", "带宽 KB/s", "本次峰值 KB/s", "时延 ms", "抖动 ms", "静默 s", "状态",
 )
 
 # 各列初始宽度（px）。全部 Interactive，用户可以自由拖动；
@@ -114,6 +116,7 @@ LINK_WIDTHS = {
     COL_TYPE: 185,
     COL_HZ: 75,
     COL_KBPS: 85,
+    COL_PEAK_KBPS: 115,
     COL_LAT: 75,
     COL_JIT: 75,
     COL_AGE: 65,
@@ -198,6 +201,8 @@ class UAVControlApp(QMainWindow):
         # 电量/位姿）。监控器由 ROS 回调写入（ROS 线程），界面定时器读快照（主线程）。
         self._link_specs, self._link_config_path = build_link_specs(self._drone_ips())
         self.link_monitor = LinkMonitor(self._link_specs)
+        self._link_peak_context = PeakContextRecorder()
+        self._link_drone_peak_kbps: Dict[int, float] = {}
         self._link_summary_labels: Dict[int, QLabel] = {}
         self._link_status_cache: Dict[int, str] = {}
 
@@ -995,7 +1000,8 @@ QFrame > QPushButton { background: transparent }
             "稀疏（低于峰值 50%）· 中断（超过 max(3 秒, 4 个周期) 无消息）。"
             "频率/带宽取最近 2 秒滑动窗口；时延只对带 header 的电量/位姿测量，"
             "并已扣掉按“窗口内最小单向时延”估计的时钟偏差。"
-            "点左侧三角可折叠单架飞机，导出 CSV 可用于优化前后的对照实验。"
+            "本次峰值取完整 2 秒窗口，悬停可查看时间；导出 CSV 同时保存峰值前后"
+            "各 5 秒的同机主题状态。清零统计会开始新的本次记录。"
         )
 
     def _build_link_page(self) -> QWidget:
@@ -1084,7 +1090,7 @@ QFrame > QPushButton { background: transparent }
             child.setToolTip(COL_TOPIC, spec.topic)
             child.setToolTip(COL_DESC, spec.description or spec.topic)
             child.setToolTip(COL_TYPE, spec.msg_type)
-            for column in (COL_HZ, COL_KBPS, COL_LAT, COL_JIT, COL_AGE):
+            for column in (COL_HZ, COL_KBPS, COL_PEAK_KBPS, COL_LAT, COL_JIT, COL_AGE):
                 child.setText(column, "--")
             child.setText(COL_STATUS, STATUS_WAITING)
             parent.addChild(child)
@@ -1114,12 +1120,23 @@ QFrame > QPushButton { background: transparent }
         """定时器回调：把监控器快照画到树上（只读，不碰 ROS）。"""
         if not hasattr(self, "link_tree"):
             return
-        rows = self.link_monitor.snapshot()
+        now = time.monotonic()
+        wall = time.time()
+        rows = self.link_monitor.snapshot(now=now, wall_time=wall)
+        self._link_peak_context.observe(now, wall, rows)
         for child, row in zip(self._link_children, rows):
             self._set_item_text(
                 child, COL_HZ, f"{row.hz:.1f}" if row.samples else "--")
             self._set_item_text(
                 child, COL_KBPS, f"{row.kbytes_per_s:.1f}" if row.samples else "--")
+            self._set_item_text(
+                child, COL_PEAK_KBPS,
+                f"{row.peak_kbytes_per_s:.1f}" if row.peak_at is not None else "--")
+            if row.peak_wall_time is not None:
+                peak_time = datetime.fromtimestamp(row.peak_wall_time).strftime("%H:%M:%S")
+                child.setToolTip(COL_PEAK_KBPS, f"峰值时间：{peak_time}；导出 CSV 可查看前后 5 秒状态")
+            else:
+                child.setToolTip(COL_PEAK_KBPS, "尚未形成完整 2 秒窗口")
             self._set_item_text(
                 child, COL_LAT, "--" if row.latency_ms is None else f"{row.latency_ms:.1f}")
             self._set_item_text(
@@ -1141,6 +1158,13 @@ QFrame > QPushButton { background: transparent }
             kbps = float(item.get("kbytes_per_s", 0.0))
             parent.setText(COL_TOPIC, f"{total} 条主题 · 在线 {online}")
             parent.setText(COL_KBPS, f"{kbps:.1f}" if online else "--")
+            if online and any(row.drone_id == drone_id and row.peak_at is not None
+                              for row in rows):
+                peak = max(self._link_drone_peak_kbps.get(drone_id, 0.0), kbps)
+                self._link_drone_peak_kbps[drone_id] = peak
+            else:
+                peak = self._link_drone_peak_kbps.get(drone_id, 0.0)
+            parent.setText(COL_PEAK_KBPS, f"{peak:.1f}" if peak else "--")
             interrupted = int(item.get("interrupted", 0))
             parent.setText(COL_STATUS, f"中断 {interrupted}" if interrupted else "")
 
@@ -1192,18 +1216,29 @@ QFrame > QPushButton { background: transparent }
         if not self._link_specs:
             self.append_log("[LINK] 没有可导出的链路主题。")
             return
-        rows = self.link_monitor.snapshot()
+        now = time.monotonic()
+        wall = time.time()
+        rows = self.link_monitor.snapshot(now=now, wall_time=wall)
+        self._link_peak_context.observe(now, wall, rows)
         log_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
-        name = f"link_monitor_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+        stamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        name = f"link_monitor_{stamp}.csv"
+        context_name = f"link_peak_context_{stamp}.csv"
         try:
             path = self.link_monitor.write_csv(os.path.join(log_dir, name), rows)
+            context_path = self._link_peak_context.write_csv(os.path.join(log_dir, context_name))
         except Exception as exc:
             self.append_log(f"[LINK] 导出失败：{exc}")
             return
-        self.append_log(f"[LINK] 已导出 {len(rows)} 条链路快照：{path}")
+        self.append_log(
+            f"[LINK] 已导出 {len(rows)} 条链路快照及 "
+            f"{self._link_peak_context.peak_count} 个峰值的前后状态：{path}、{context_path}"
+        )
 
     def _reset_link_stats(self) -> None:
         self.link_monitor.reset()
+        self._link_peak_context.reset()
+        self._link_drone_peak_kbps.clear()
         self._link_status_cache.clear()
         self.append_log("[LINK] 链路统计已清零，开始新的统计窗口。")
 

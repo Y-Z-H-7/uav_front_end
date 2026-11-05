@@ -2,6 +2,7 @@
 """link_monitor 的离线测试：不连 ROS、不建界面窗口。"""
 
 import os
+import csv
 from pathlib import Path
 import sys
 import tempfile
@@ -12,6 +13,7 @@ import unittest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import link_monitor
+from link_peak_context import PeakContextRecorder
 from link_monitor import (
     LinkMonitor,
     LinkTopicSpec,
@@ -151,6 +153,39 @@ class LinkMonitorTests(unittest.TestCase):
         row = monitor.snapshot(now=5.0)[0]    # 窗口里只剩 4.0 那条
         # 应按 2 秒窗口算，而不是把它压进 0.2 秒 → 0.5 KB/s（旧实现会得 1.0）
         self.assertAlmostEqual(row.kbytes_per_s, 0.5, delta=0.05)
+
+    def test_session_bandwidth_peak_waits_for_full_window_and_resets(self):
+        monitor = LinkMonitor([battery_spec()])
+        monitor.record(1, BATTERY_1, 1024, recv_time=0.0)
+        self.assertEqual(monitor.snapshot(now=0.2)[0].peak_kbytes_per_s, 0.0)
+        monitor.record(1, BATTERY_1, 1024, recv_time=1.0)
+        row = monitor.snapshot(now=2.0, wall_time=1000.0)[0]
+        self.assertAlmostEqual(row.peak_kbytes_per_s, 1.0)
+        self.assertEqual(row.peak_at, 2.0)
+        self.assertEqual(row.peak_wall_time, 1000.0)
+        self.assertAlmostEqual(monitor.snapshot(now=5.0)[0].peak_kbytes_per_s, 1.0)
+        monitor.reset()
+        self.assertEqual(monitor.snapshot(now=5.0)[0].peak_kbytes_per_s, 0.0)
+
+    def test_peak_context_exports_before_and_after_state(self):
+        monitor = LinkMonitor([battery_spec(), LinkTopicSpec(1, POSE_1, "geometry_msgs/PoseStamped")])
+        recorder = PeakContextRecorder(radius_seconds=5)
+        for tick in range(21):
+            at = tick / 2
+            monitor.record(1, BATTERY_1, 2000 if at == 3 else 100, recv_time=at)
+            if tick % 2 == 0:
+                monitor.record(1, POSE_1, 50, recv_time=at)
+            recorder.observe(at, 1000 + at, monitor.snapshot(now=at, wall_time=1000 + at))
+        with tempfile.TemporaryDirectory() as folder:
+            path = os.path.join(folder, "peak.csv")
+            recorder.write_csv(path)
+            with open(path, encoding="utf-8-sig") as source:
+                rows = list(csv.DictReader(source))
+        battery_rows = [row for row in rows if row["peak_topic"] == BATTERY_1]
+        self.assertTrue(any(float(row["relative_seconds"]) < 0 for row in battery_rows))
+        self.assertTrue(any(float(row["relative_seconds"]) > 0 for row in battery_rows))
+        self.assertIn(POSE_1, {row["observed_topic"] for row in battery_rows})
+        self.assertTrue(all(row["status"] for row in battery_rows))
 
     def test_jitter_is_reported_in_milliseconds(self):
         monitor = LinkMonitor([battery_spec()])
