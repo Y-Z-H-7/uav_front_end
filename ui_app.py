@@ -55,6 +55,7 @@ from link_monitor import (
 from mission_orchestrator import MissionOrchestrator
 from ros_adapter import RosAdapter, LANDING_REPEAT_COUNT, LANDING_REPEAT_INTERVAL
 from transfer_controller import TransferController
+from rviz_snapshot import MapSnapshotCache, save_map_snapshot
 
 
 def _format_age(age_s: Optional[float]) -> str:
@@ -344,14 +345,17 @@ class UAVControlApp(QMainWindow):
         # 地面站组
         gcs_frame = QFrame()
         gcs_frame.setObjectName('gcsFrame')
-        gcs_layout = QHBoxLayout(gcs_frame)
+        gcs_layout = QGridLayout(gcs_frame)
         gcs_layout.setSpacing(8)
         self.launch_bridge_button = QPushButton("启动 bridge_node_gcs")
         self.launch_bridge_button.setProperty('role','core')
         self.launch_exploration_rviz_button = QPushButton("启动 exploration RViz")
         self.launch_exploration_rviz_button.setProperty('role','core')
-        gcs_layout.addWidget(self.launch_bridge_button)
-        gcs_layout.addWidget(self.launch_exploration_rviz_button)
+        self.save_rviz_snapshot_button = QPushButton("保存 RViz 地图快照")
+        self.save_rviz_snapshot_button.setProperty('role', 'core')
+        gcs_layout.addWidget(self.launch_bridge_button, 0, 0)
+        gcs_layout.addWidget(self.launch_exploration_rviz_button, 0, 1)
+        gcs_layout.addWidget(self.save_rviz_snapshot_button, 1, 0, 1, 2)
         right_layout.addWidget(gcs_frame)
 
         # 飞行控制组
@@ -424,6 +428,8 @@ class UAVControlApp(QMainWindow):
             "launch_bridge", lambda log: self.mission.launch_bridge_node_gcs(log)))
         self.launch_exploration_rviz_button.clicked.connect(lambda: self._run_background_task(
             "launch_exploration_rviz", lambda log: self.mission.launch_exploration_rviz(log)))
+        self.save_rviz_snapshot_button.clicked.connect(lambda: self._run_background_task(
+            "save_rviz_snapshot", self._save_rviz_snapshot))
         self.land_all_button.clicked.connect(
             lambda: self.request_landing(self._get_selected_drone_ids())
         )
@@ -478,6 +484,7 @@ QFrame > QPushButton { background: transparent }
 
         self._apply_ssh_snapshot({})
         # 控件创建完成后再接收遥测，回调通过 Qt 信号交给 UI 线程。
+        self.map_snapshot_cache = MapSnapshotCache(self.mission.DRONES)
         self.ros_adapter = RosAdapter(
             self.ros_log_signal.emit,
             landing_topics={
@@ -487,6 +494,7 @@ QFrame > QPushButton { background: transparent }
             battery_callback=self.battery_signal.emit,
             pose_callback=self.pose_signal.emit,
             link_monitor=self.link_monitor,
+            map_snapshot_cache=self.map_snapshot_cache,
         )
         drone_names = ', '.join(d.display_name for d in self.mission.DRONES.values())
         self.append_log(f"界面已启动，等待任务指令。（支持 {len(self.mission.DRONES)} 架无人机：{drone_names}）")
@@ -700,6 +708,26 @@ QFrame > QPushButton { background: transparent }
             btn.setEnabled(enabled)
         self.launch_bridge_button.setEnabled(enabled)
         self.launch_exploration_rviz_button.setEnabled(enabled)
+        self.save_rviz_snapshot_button.setEnabled(enabled)
+
+    def _save_rviz_snapshot(self, log):
+        if not self.ros_adapter.ros_ready:
+            log("[RViz] ROS 未就绪，无法保存地图快照。")
+            return False
+        try:
+            output_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "RVizlog")
+            result = save_map_snapshot(self.map_snapshot_cache, output_dir)
+        except Exception as exc:
+            log(f"[RViz] 保存失败：{exc}")
+            return False
+        ages = "、".join(
+            f"{drone_id}号机 {result.ages_seconds[drone_id]:.0f}秒前"
+            for drone_id in result.saved_ids
+        )
+        log(f"[RViz] 地图快照已保存：{result.path}（最新帧：{ages}）")
+        if result.missing_ids:
+            log(f"[RViz] 未收到这些飞机的地图，文件中不包含：{result.missing_ids}")
+        return True
 
     def _clear_worker(self):
         """清空后台线程引用（由 worker.finished 触发，帮助 Qt 回收线程对象）。"""
@@ -806,6 +834,10 @@ QFrame > QPushButton { background: transparent }
         if not selected:
             self.append_log("[TASK] 未选中任何飞机，已忽略")
             return
+        if self._task_in_progress:
+            self.append_log("[TASK] 当前任务尚未结束，已忽略启动探索")
+            return
+        self.map_snapshot_cache.clear(selected)
         self.append_log(f"[TASK] 目标飞机: {selected}")
         self._run_background_task(
             "start_exploration_stage",

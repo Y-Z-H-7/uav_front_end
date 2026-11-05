@@ -96,6 +96,7 @@ class RosAdapter:
         battery_callback: Optional[Callable[[int, float, float], None]] = None,
         pose_callback: Optional[Callable[[int, float, float, float], None]] = None,
         link_monitor=None,
+        map_snapshot_cache=None,
     ):
         self.log_callback = log_callback or (lambda message: None)
         self.battery_callback = battery_callback or (lambda uav_id, pct, volt: None)
@@ -104,6 +105,7 @@ class RosAdapter:
         # 链路监测器（link_monitor.LinkMonitor）；为 None 时不做任何额外订阅。
         # 电量/位姿的回调里顺手上报一次到达，其余主题用 AnyMsg 订阅后上报。
         self.link_monitor = link_monitor
+        self.map_snapshot_cache = map_snapshot_cache
 
         # 这些 topic 可由 swarm_ros_bridge 转发到目标无人机。
         self.landing_topics = landing_topics or {
@@ -185,14 +187,16 @@ class RosAdapter:
         （前端虚拟环境里往往没有 source 过 RACER 工作空间）。
         """
         monitor = self.link_monitor
-        if monitor is None:
+        cache = self.map_snapshot_cache
+        if monitor is None and cache is None:
             return
         any_msg = getattr(rospy, "AnyMsg", None)
         if any_msg is None:
             self._log("当前 rospy 不支持 AnyMsg，链路监控只统计电量/位姿主题。")
             return
         subscribed = 0
-        for spec in monitor.specs():
+        subscribed_topics = set()
+        for spec in monitor.specs() if monitor is not None else ():
             if spec.has_stamp:
                 continue
             try:
@@ -207,19 +211,39 @@ class RosAdapter:
                 continue
             self._subs.append(sub)
             subscribed += 1
+            subscribed_topics.add(spec.topic)
         if subscribed:
             self._log(f"链路监控已订阅 {subscribed} 条原始主题（AnyMsg，不反序列化）。")
+        # A missing/invalid bridge config must not prevent map snapshot capture.
+        if cache is not None:
+            for topic in cache.topics:
+                if topic in subscribed_topics:
+                    continue
+                try:
+                    self._subs.append(rospy.Subscriber(
+                        topic, any_msg, self._make_map_snapshot_cb(topic), queue_size=1,
+                    ))
+                except Exception as exc:
+                    self._log(f"地图快照订阅失败：{topic}（{exc}）")
 
     def _make_raw_link_cb(self, spec):
         monitor = self.link_monitor
 
         def cb(msg):
+            cache = self.map_snapshot_cache
+            if cache is not None and spec.topic in cache.topics:
+                cache.record(spec.topic, getattr(msg, "_buff", b""))
             try:
                 monitor.record(spec.drone_id, spec.topic, len(getattr(msg, "_buff", b"") or b""))
             except Exception:
                 # 监测永远不能影响主链路或 ROS 回调线程，异常直接吞掉。
                 pass
 
+        return cb
+
+    def _make_map_snapshot_cb(self, topic):
+        def cb(msg):
+            self.map_snapshot_cache.record(topic, getattr(msg, "_buff", b""))
         return cb
 
     def _record_link(self, drone_id: int, topic: str, msg) -> None:

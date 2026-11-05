@@ -11,6 +11,7 @@ __pycache__/
 # Build and runtime artifacts
 build/
 dist/
+RVizlog/
 *.log
 # 链路监控导出的快照
 logs/*.csv
