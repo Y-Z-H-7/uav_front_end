@@ -108,6 +108,18 @@ class TelemetryUITests(unittest.TestCase):
         self.app.processEvents()
         self.assertEqual(self.window._status_cards[2]["battery"].text(), "电量: 50%  (15.00V)")
 
+    def test_battery_warning_and_stale_data(self):
+        card = self.window._status_cards[2]
+        self.deliver("battery", SimpleNamespace(percentage=0.19, voltage=23.5))
+        self.app.processEvents()
+        self.assertIn("尽快安全降落", card["battery_alert"].text())
+        self.assertIn("已到预留线", card["battery_eta"].text())
+        self.window._battery_monitors[2].last_seen -= 11
+        self.window._refresh_battery_views()
+        self.assertIn("数据超时", card["battery_alert"].text())
+        self.assertEqual(card["battery"].text(), "电量: --  (--V)")
+        self.assertEqual(card["battery_eta"].text(), "到30%预留电量: --")
+
 
 if __name__ == "__main__":
     unittest.main()

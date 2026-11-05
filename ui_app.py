@@ -52,6 +52,8 @@ from link_monitor import (
     LinkMonitor,
     build_link_specs,
 )
+from battery_monitor import BatteryMonitor
+from battery_history import BatteryHistoryRecorder
 from mission_orchestrator import MissionOrchestrator
 from ros_adapter import RosAdapter, LANDING_REPEAT_COUNT, LANDING_REPEAT_INTERVAL
 from transfer_controller import TransferController
@@ -172,6 +174,13 @@ class UAVControlApp(QMainWindow):
         main_layout = QHBoxLayout(control_page)
 
         self._status_cards: Dict[int, Dict[str, QLabel]] = {}
+        self._battery_monitors: Dict[int, BatteryMonitor] = {}
+        self._battery_display_states: Dict[int, str] = {}
+        self._battery_history = BatteryHistoryRecorder(
+            os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                         "logs", "battery_discharge.csv")
+        )
+        self._battery_history_error_reported = False
         self._select_buttons: Dict[int, QPushButton] = {}
         self._selected_drones: set = set()
         self._end_buttons: Dict[int, QPushButton] = {}
@@ -234,7 +243,7 @@ class UAVControlApp(QMainWindow):
             # 尺寸策略：宽度按比例扩展、高度固定，避免某张卡片挤占过多横向空间
             f.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
             f.setMinimumWidth(220)
-            f.setMaximumHeight(120)
+            f.setMaximumHeight(185)
             v = QVBoxLayout(f)
             v.setContentsMargins(6, 4, 6, 4)
             v.setSpacing(2)
@@ -260,6 +269,15 @@ class UAVControlApp(QMainWindow):
             battery_font.setPointSize(10)
             battery.setFont(battery_font)
             v.addWidget(battery)
+            battery_alert = QLabel('电量提示: 等待数据')
+            battery_alert.setObjectName('statusBatteryAlert')
+            battery_alert.setWordWrap(True)
+            v.addWidget(battery_alert)
+            battery_eta = QLabel('到30%预留电量: 估算中')
+            battery_eta.setObjectName('statusBatteryEta')
+            battery_eta.setWordWrap(True)
+            battery_eta.setToolTip('按最近电量下降速度估算；待机与飞行耗电不同，仅供参考。')
+            v.addWidget(battery_eta)
             position = QLabel('位置: --')
             position.setObjectName('statusPosition')
             position_font = QFont()
@@ -270,7 +288,12 @@ class UAVControlApp(QMainWindow):
             info.setObjectName('statusInfo')
             info.setWordWrap(True)
             info.setMaximumHeight(40)
-            self._status_cards[drone_id] = {"dot": dot, "info": info, "battery": battery, "position": position}
+            self._status_cards[drone_id] = {
+                "dot": dot, "info": info, "battery": battery,
+                "battery_alert": battery_alert, "battery_eta": battery_eta,
+                "position": position,
+            }
+            self._battery_monitors[drone_id] = BatteryMonitor()
 
             # 每个无人机卡片底部都有一个选择开关，用户可决定是否参与后续批量起飞/检查/降落操作。
             # 绿色 = 选中，红色 = 未选中；这正是本程序中“批量操作作用对象”的核心控制点。
@@ -516,6 +539,10 @@ QFrame > QPushButton { background: transparent }
         self._link_timer.setInterval(500)
         self._link_timer.timeout.connect(self._refresh_link_view)
         self._link_timer.start()
+        self._battery_timer = QTimer(self)
+        self._battery_timer.setInterval(1000)
+        self._battery_timer.timeout.connect(self._refresh_battery_views)
+        self._battery_timer.start()
 
         # 图传页的状态轮询：只读 active.json（主程序每 5 秒写一次），开销极小。
         # 2 秒的刷新间隔能让启停按钮的状态及时跟上。
@@ -583,6 +610,67 @@ QFrame > QPushButton { background: transparent }
         voltage = f"{volt:.2f}V" if volt_ok else "--V"
         text = f"电量: {percentage}  ({voltage})"
         card["battery"].setText(text)
+        now = time.monotonic()
+        monitor = self._battery_monitors[uav_id]
+        self._record_battery_history(uav_id, monitor, now)
+        monitor.update(pct, now)
+        self._record_battery_history(uav_id, monitor, now)
+        self._refresh_battery_view(uav_id)
+
+    def _record_battery_history(self, uav_id, monitor, now):
+        try:
+            self._battery_history.record(uav_id, monitor, now)
+            self._battery_history_error_reported = False
+        except OSError as exc:
+            if not self._battery_history_error_reported:
+                self._battery_history_error_reported = True
+                self.append_log(f"[BATTERY] 耗电记录写入失败：{exc}")
+
+    def _refresh_battery_views(self):
+        for uav_id in self._battery_monitors:
+            self._refresh_battery_view(uav_id)
+
+    def _refresh_battery_view(self, uav_id: int):
+        monitor = self._battery_monitors[uav_id]
+        card = self._status_cards[uav_id]
+        now = time.monotonic()
+        status = monitor.status(now)
+        if status == "waiting":
+            message, color = "等待数据", "#7F8C8D"
+        elif status == "stale":
+            message, color = "数据超时，请检查链路", "#C0392B"
+            card["battery"].setText("电量: --  (--V)")
+        elif status == "invalid":
+            message, color = "数据无效，请检查电池监测", "#C0392B"
+        else:
+            message, color = (
+                ("电量充足", "#27AE60"),
+                ("≤80%：关注电量", "#2D6A9F"),
+                ("≤60%：规划返航余量", "#C07800"),
+                ("≤30%：已到预留线，准备降落", "#C0392B"),
+                ("≤20%：尽快安全降落，防止欠压", "#B71C1C"),
+            )[monitor.level]
+        card["battery_alert"].setText(f"电量提示: {message}")
+        card["battery_alert"].setStyleSheet(f"color: {color}; font-weight: 600;")
+        if status != "valid":
+            eta_text = "到30%预留电量: --"
+        elif monitor.pct <= 0.30:
+            eta_text = "到30%预留电量: 已到预留线"
+        else:
+            minutes = monitor.estimate_minutes(now)
+            eta = "估算中" if minutes is None else (
+                "不足 1 分钟" if minutes < 1 else f"约 {int(minutes)} 分钟（参考）")
+            eta_text = f"到30%预留电量: {eta}"
+        card["battery_eta"].setText(eta_text)
+        card["battery_alert"].setToolTip(
+            "低电量在大负载下可能欠压；出现鼓包或异常时停止使用，勿继续充电。"
+            "界面提示不能替代 PX4 低电保护。"
+        )
+        state = status if status != "valid" else f"level:{monitor.level}"
+        if self._battery_display_states.get(uav_id) != state:
+            self._battery_display_states[uav_id] = state
+            if status == "stale" or status == "invalid" or monitor.level >= 1:
+                self.append_log(f"[BATTERY] {uav_id} 号机：{message}")
 
     @Slot(int, float, float, float)
     def _on_pose(self, uav_id: int, x: float, y: float, z: float):
