@@ -75,6 +75,11 @@ for ROS_PYTHON_PATH in "${ROS_PYTHON_PATHS[@]}"; do
     export PYTHONPATH="${ROS_PYTHON_PATH}${PYTHONPATH:+:${PYTHONPATH}}"
   fi
 done
+# Keep venv packages ahead of system packages. rosbag imports the system
+# Cryptodome package, which needs the matching cffi Python module and native
+# extension from this venv rather than the older system _cffi_backend.
+VENV_SITE="$("${VENV_PATH}/bin/python" -c 'import sysconfig; print(sysconfig.get_paths()["purelib"])')"
+export PYTHONPATH="${VENV_SITE}${PYTHONPATH:+:${PYTHONPATH}}"
 
 # 3) 依赖自检（快速失败，避免 UI 启动后才报错）
 python - <<'PY'
