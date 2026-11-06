@@ -71,8 +71,8 @@ class MissionOrchestrator:
             session_name="nuc_drone",
             windows=(
                 WindowDef("px4", main_cmd=_PX4_CMD_NUC_FLY, execute=True),
-                WindowDef("livox", main_cmd="roslaunch livox_ros_driver2 msg_MID360.launch", execute=True),
-                WindowDef("fastlio", main_cmd="roslaunch fast_lio mapping_mid360.launch", execute=True),
+                WindowDef("livox", setups=("source ~/ws_livox/devel/setup.bash",), main_cmd="roslaunch livox_ros_driver2 msg_MID360.launch", execute=True),
+                WindowDef("fastlio", setups=("source ~/fast_lio_ws/devel/setup.bash",), main_cmd="roslaunch fast_lio mapping_mid360.launch", execute=True),
                 WindowDef("offb_node", setups=("source ~/racer/devel/setup.bash",), main_cmd="rosrun cxr_egoctrl_v1 offb_node", execute=True),
                 WindowDef("ego_transfer", cd_cmd="cd ~/racer/src/scripts", main_cmd="python3 ego_transfer.py", execute=True),
                 WindowDef("trans", setups=("source ~/racer/devel/setup.bash",), main_cmd="rosrun cxr_egoctrl_v1 trans.py", execute=True),
