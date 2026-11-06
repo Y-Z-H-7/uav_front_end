@@ -123,7 +123,12 @@ DRONES = {
 
 **保存 RViz 地图快照** — 前端运行期间缓存每架飞机最新的一帧 `/sdf_map/occupancy_all_N` 点云；任务结束后点击按钮，后台保存一个 `RVizlog/rviz_map_时间.bag` 文件。按钮会报告未收到地图的飞机及已保存帧的年龄。请保持地面站前端运行到保存完成；关闭前端会清空内存中的快照。保存只取已收到的地图，不再向无人机请求数据，也不会保存 RViz 窗口配置或规划器内部的空闲/未知栅格。
 
-回看时先启动地面站 RViz，再运行 `rosbag play --pause RVizlog/rviz_map_时间.bag`，等待 RViz 连接后按空格播放。当前 `swarm.rviz` 默认关闭 3 号机地图显示；回看 nuc2 时需在 Maps 组启用 `occupied_all3`。
+地面站首次使用前运行 `bash tools/install_rvizlog_handler.sh`。此后在文件管理器双击
+`RVizlog/rviz_map_时间.bag`，会打开独立的 RViz 地图窗口，自动显示该文件中保存的各机点云。
+点击 RViz 的 **Move Camera** 工具后拖动鼠标可以旋转，滚轮缩放；关闭窗口即结束回看。
+查看器使用独立 ROS master 与 `/rvizlog/occupancy_all_N` 话题，不干扰正在运行的桥接和
+普通 RViz。也可在终端运行 `bash tools/open_rvizlog.sh RVizlog/rviz_map_时间.bag`。
+该文件只含保存时各机的最新一帧占据点云，不含实时过程或 RViz 界面布局。
 
 ### 飞行控制组
 
